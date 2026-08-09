@@ -1,32 +1,41 @@
--- Setup script for ticker_news_documents table
+-- Setup script for weather_news table
 -- Run this manually in your Lakebase Postgres database before running the notebook
 
--- Create the news documents table
-CREATE TABLE IF NOT EXISTS ticker_news_documents (
+-- Create the weather_news table
+CREATE TABLE IF NOT EXISTS weather_news (
     id TEXT PRIMARY KEY,
-    ticker TEXT NOT NULL,
-    title TEXT NOT NULL,
+
+    location TEXT NOT NULL,
+    source_type TEXT NOT NULL DEFAULT 'alert',
+
+    event TEXT,
+    headline TEXT,
+
+    narrative_text TEXT NOT NULL,
+
     description TEXT,
-    author TEXT,
-    article_url TEXT,
-    publisher_name TEXT,
-    keywords JSONB,
-    sentiment TEXT,
-    sentiment_reasoning TEXT,
-    published_utc TIMESTAMPTZ,
+    instruction TEXT,
+
+    severity TEXT,
+    certainty TEXT,
+    urgency TEXT,
+
+    effective_at TIMESTAMPTZ,
+    onset_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
+
+    sender_name TEXT,
+    sender_id TEXT,
+
+    area_desc TEXT,
+    geocode JSONB,
+
+    geometry JSONB,
+
     payload JSONB NOT NULL,
-    synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
+
+    synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
--- Create index for ticker lookups
-CREATE INDEX IF NOT EXISTS idx_ticker_news_documents_ticker 
-ON ticker_news_documents (ticker);
-
--- Verify the table was created
-SELECT 
-    table_name,
-    column_name,
-    data_type
-FROM information_schema.columns
-WHERE table_name = 'ticker_news_documents'
-ORDER BY ordinal_position;
