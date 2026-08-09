@@ -3,51 +3,54 @@
 # [tool.databricks.environment]
 # environment_version = "5"
 # ///
+
 # MAGIC %md
-# MAGIC # Ingest Ticker News -> Vector Embeddings (Lakebase)
+# MAGIC # Ingest Weather Documents -> Vector Embeddings (Lakebase)
 # MAGIC
-# MAGIC This notebook is part of the **Context Engineering on Databricks** course.
+# MAGIC This notebook is part of the Weather Intelligence homework.
 # MAGIC
 # MAGIC It:
-# MAGIC 1. Reads the `watchlist` table in Lakebase to find out which ticker
-# MAGIC    symbols are currently being tracked.
-# MAGIC 2. Fetches recent news for those tickers directly from the Massive
-# MAGIC    `/v2/reference/news` endpoint (see `massive_client.py` for the same
-# MAGIC    call shape used by the Flask app's `POST /news/sync` route), rate
-# MAGIC    limited to stay within the free Massive API tier's strict quota, and
-# MAGIC    upserts the results into the `ticker_news_documents` table.
-# MAGIC 3. Computes a sentence embedding for each article (title + description)
-# MAGIC    using Spark, distributed across the cluster via a pandas UDF, and
-# MAGIC    writes them into a `ticker_news_embeddings` table using the
-# MAGIC    `pgvector` Postgres extension so downstream RAG / context-engineering
-# MAGIC    exercises can run similarity search directly in Postgres.
-# MAGIC 4. Fetches the full article body for each `article_url` (via
-# MAGIC    `trafilatura`, which strips nav/ads/boilerplate from the raw HTML),
-# MAGIC    splits it into overlapping text chunks, embeds each chunk, and writes
-# MAGIC    them into a `ticker_news_chunk_embeddings` table - so RAG exercises can
-# MAGIC    retrieve fine-grained passages from article bodies, not just
-# MAGIC    title/description.
+# MAGIC 1. Reads weather documents previously harvested from the National Weather
+# MAGIC    Service (NWS) API and stored in the `weather_news` Lakebase table.
+# MAGIC 2. Finds documents that do not yet have embeddings.
+# MAGIC 3. Splits each document's `narrative_text` into overlapping chunks.
+# MAGIC 4. Embeds each chunk using
+# MAGIC    `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions).
+# MAGIC 5. Writes the chunk embeddings directly to Lakebase using psycopg2.
+# MAGIC 6. Stores embeddings in a pgvector `VECTOR(384)` column with an HNSW
+# MAGIC    cosine-similarity index.
 # MAGIC
-# MAGIC It re-uses the SAME Lakebase secret (scope `database`, key `lakebase-url`)
-# MAGIC that `lakebase.py` uses in the Flask app, so no extra secrets need to be
-# MAGIC created for this notebook.
+# MAGIC The Flask application's `/weather/sync` endpoint is responsible for
+# MAGIC harvesting NWS data and populating `weather_news`.
+# MAGIC
+# MAGIC The resulting pipeline is:
+# MAGIC
+# MAGIC NWS API
+# MAGIC   -> /weather/sync
+# MAGIC   -> weather_news
+# MAGIC   -> this notebook
+# MAGIC   -> weather_embeddings
+# MAGIC   -> /weather/search
+# MAGIC
+# MAGIC The notebook intentionally does NOT use Spark JDBC for writes.
+# MAGIC Lakebase writes are performed with psycopg2.
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Install Dependencies
 # MAGIC
-# MAGIC This notebook requires:
-# MAGIC - **pg8000**: Pure Python PostgreSQL driver (works on Serverless, no C extensions)
-# MAGIC   - **Why pg8000 instead of psycopg2?** psycopg2-binary has native C extensions that crash on Databricks Serverless compute (SIGABRT 134 kernel crashes). pg8000 is pure Python and works reliably on Serverless.
-# MAGIC - **sentence-transformers**: Embedding model library for generating vector representations
-# MAGIC - **trafilatura**: Article content extraction from HTML (strips ads/nav/boilerplate)
-# MAGIC - **requests**: HTTP client for fetching news from Massive API
+# MAGIC Required packages:
+# MAGIC - psycopg2-binary: PostgreSQL/Lakebase connection
+# MAGIC - sentence-transformers: text embedding model
+# MAGIC
+# MAGIC The NWS API itself is called by the Flask application's
+# MAGIC `weather_client.py`, not by this notebook.
 
 # COMMAND ----------
 
-# DBTITLE 1,Install all required packages
-# MAGIC %pip install -q pg8000 sentence-transformers trafilatura requests
+# DBTITLE 1,Install required packages
+# MAGIC %pip install -q psycopg2-binary sentence-transformers
 
 # COMMAND ----------
 
@@ -56,779 +59,716 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Config
+# MAGIC ## Configuration
 # MAGIC
-# MAGIC Widgets let you override the source/destination table names and the
-# MAGIC embedding model without editing the notebook - useful when running this
-# MAGIC as a scheduled Databricks Job.
+# MAGIC These widgets allow the notebook to be run manually or scheduled as a
+# MAGIC Databricks Job without changing the source code.
 
 # COMMAND ----------
 
-dbutils.widgets.text("watchlist_table_name", "watchlist", "Source table (watchlist symbols)")
-dbutils.widgets.text("news_table_name", "ticker_news_documents", "Destination table (raw news)")
-dbutils.widgets.text("embeddings_table_name", "ticker_news_embeddings", "Destination table (vectors)")
-dbutils.widgets.text("chunk_embeddings_table_name", "ticker_news_chunk_embeddings", "Destination table (chunk vectors)")
-dbutils.widgets.text("embedding_model", "sentence-transformers/all-MiniLM-L6-v2", "Embedding model")
-dbutils.widgets.text("massive_secret_scope", "massive", "Massive API secret scope")
-dbutils.widgets.text("massive_secret_key", "api-key", "Massive API secret key")
-dbutils.widgets.text("massive_api_base_url", "https://api.massive.com", "Massive API base URL")
-dbutils.widgets.text("news_fetch_limit", "50", "Max articles to fetch per ticker")
-dbutils.widgets.text("max_requests_per_minute", "5", "Massive API rate limit (free tier is strict)")
-dbutils.widgets.text("chunk_size", "800", "Article content chunk size (chars)")
-dbutils.widgets.text("chunk_overlap", "100", "Article content chunk overlap (chars)")
+dbutils.widgets.text(
+    "weather_table_name",
+    "weather_news",
+    "Source table (weather documents)"
+)
 
-WATCHLIST_TABLE_NAME = dbutils.widgets.get("watchlist_table_name")
-NEWS_TABLE_NAME = dbutils.widgets.get("news_table_name")
+dbutils.widgets.text(
+    "embeddings_table_name",
+    "weather_embeddings",
+    "Destination table (chunk embeddings)"
+)
+
+dbutils.widgets.text(
+    "embedding_model",
+    "sentence-transformers/all-MiniLM-L6-v2",
+    "Embedding model"
+)
+
+dbutils.widgets.text(
+    "chunk_size",
+    "800",
+    "Chunk size (characters)"
+)
+
+dbutils.widgets.text(
+    "chunk_overlap",
+    "100",
+    "Chunk overlap (characters)"
+)
+
+dbutils.widgets.text(
+    "batch_size",
+    "50",
+    "Embedding/write batch size"
+)
+
+WEATHER_TABLE_NAME = dbutils.widgets.get("weather_table_name")
 EMBEDDINGS_TABLE_NAME = dbutils.widgets.get("embeddings_table_name")
-CHUNK_EMBEDDINGS_TABLE_NAME = dbutils.widgets.get("chunk_embeddings_table_name")
 EMBEDDING_MODEL_NAME = dbutils.widgets.get("embedding_model")
-MASSIVE_SECRET_SCOPE = dbutils.widgets.get("massive_secret_scope")
-MASSIVE_SECRET_KEY = dbutils.widgets.get("massive_secret_key")
-MASSIVE_API_BASE_URL = dbutils.widgets.get("massive_api_base_url")
-NEWS_FETCH_LIMIT = int(dbutils.widgets.get("news_fetch_limit"))
-MAX_REQUESTS_PER_MINUTE = int(dbutils.widgets.get("max_requests_per_minute"))
 CHUNK_SIZE = int(dbutils.widgets.get("chunk_size"))
 CHUNK_OVERLAP = int(dbutils.widgets.get("chunk_overlap"))
+BATCH_SIZE = int(dbutils.widgets.get("batch_size"))
 
-# Different sentence-transformers models emit different vector sizes, and the
-# pgvector column type (VECTOR(N)) must match exactly. Rather than hardcoding
-# one dimension, switch on the model name so swapping EMBEDDING_MODEL_NAME via
-# the widget above automatically resizes the destination table's vector column.
-match EMBEDDING_MODEL_NAME:
-    case "sentence-transformers/all-MiniLM-L6-v2":
-        EMBEDDING_DIM = 384
-    case "sentence-transformers/all-MiniLM-L12-v2":
-        EMBEDDING_DIM = 384
-    case "sentence-transformers/all-mpnet-base-v2":
-        EMBEDDING_DIM = 768
-    case "sentence-transformers/paraphrase-multilingual-mpnet-base-v2":
-        EMBEDDING_DIM = 768
-    case "BAAI/bge-small-en-v1.5":
-        EMBEDDING_DIM = 384
-    case "BAAI/bge-base-en-v1.5":
-        EMBEDDING_DIM = 768
-    case "BAAI/bge-large-en-v1.5":
-        EMBEDDING_DIM = 1024
-    case "text-embedding-3-small":
-        EMBEDDING_DIM = 1536
-    case "text-embedding-3-large":
-        EMBEDDING_DIM = 3072
-    case _:
-        raise ValueError(
-            f"Unknown embedding model {EMBEDDING_MODEL_NAME!r} - add its output "
-            "dimension to the match/case block above before running this notebook."
+# The assignment specifies all-MiniLM-L6-v2 / 384 dimensions.
+if EMBEDDING_MODEL_NAME == "sentence-transformers/all-MiniLM-L6-v2":
+    EMBEDDING_DIM = 384
+else:
+    raise ValueError(
+        f"Unsupported embedding model: {EMBEDDING_MODEL_NAME!r}. "
+        "This weather app is configured for "
+        "sentence-transformers/all-MiniLM-L6-v2 (384 dimensions)."
+    )
+
+if CHUNK_OVERLAP >= CHUNK_SIZE:
+    raise ValueError("chunk_overlap must be smaller than chunk_size")
+
+print(f"Weather document table: {WEATHER_TABLE_NAME}")
+print(f"Embedding table:        {EMBEDDINGS_TABLE_NAME}")
+print(f"Embedding model:        {EMBEDDING_MODEL_NAME}")
+print(f"Embedding dimensions:   {EMBEDDING_DIM}")
+print(f"Chunk size:              {CHUNK_SIZE}")
+print(f"Chunk overlap:           {CHUNK_OVERLAP}")
+print(f"Batch size:              {BATCH_SIZE}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Lakebase Connection
+# MAGIC
+# MAGIC This notebook uses the same `lakebase.py` connection helper used by the
+# MAGIC Flask application.
+# MAGIC
+# MAGIC The assignment specifically requires psycopg2 for the embedding pipeline.
+
+# COMMAND ----------
+
+import lakebase
+
+# Test the Lakebase connection.
+
+with lakebase.get_connection() as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_database(), current_user")
+        database, user = cur.fetchone()
+
+print("Lakebase connection successful.")
+print(f"Database: {database}")
+print(f"User:     {user}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Verify Required Tables
+# MAGIC
+# MAGIC The SQL setup files should already have created:
+# MAGIC
+# MAGIC - `weather_news`
+# MAGIC - `weather_embeddings`
+# MAGIC
+# MAGIC The expected `weather_news` structure includes:
+# MAGIC
+# MAGIC - `id`
+# MAGIC - `location`
+# MAGIC - `source_type`
+# MAGIC - `headline`
+# MAGIC - `narrative_text`
+# MAGIC - `issued_at`
+# MAGIC - `effective_at`
+# MAGIC - `payload`
+# MAGIC - `synced_at`
+# MAGIC
+# MAGIC The expected `weather_embeddings` structure includes:
+# MAGIC
+# MAGIC - `id`
+# MAGIC - `document_id`
+# MAGIC - `chunk_index`
+# MAGIC - `chunk_text`
+# MAGIC - `embedding`
+# MAGIC - `model_name`
+# MAGIC - `created_at`
+
+# COMMAND ----------
+
+from psycopg2.extras import RealDictCursor
+
+with lakebase.get_connection() as conn:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+
+        cur.execute(
+            """
+            SELECT
+                table_name,
+                column_name,
+                data_type,
+                udt_name
+            FROM information_schema.columns
+            WHERE table_name IN (%s, %s)
+            ORDER BY table_name, ordinal_position
+            """,
+            (WEATHER_TABLE_NAME, EMBEDDINGS_TABLE_NAME),
         )
 
-print(f"Using model {EMBEDDING_MODEL_NAME!r} -> {EMBEDDING_DIM}-dim vectors")
+        table_columns = cur.fetchall()
+
+for row in table_columns:
+    print(
+        f"{row['table_name']}.{row['column_name']}: "
+        f"{row['data_type']} ({row['udt_name']})"
+    )
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Resolve the Lakebase connection URL
+# MAGIC ## Check Weather Documents
 # MAGIC
-# MAGIC Same secret, same decoding scheme as `lakebase.py`: a single base64-encoded
-# MAGIC Postgres URL (`postgresql://role:password@host:5432/db?sslmode=require`)
-# MAGIC stored in a Databricks secret scope. We parse it into the pieces both
-# MAGIC Spark's JDBC reader AND pg8000 connections need (host/port/database/user/password).
+# MAGIC The Flask application's `/weather/sync` endpoint should be run before
+# MAGIC this notebook.
 # MAGIC
-# MAGIC **Database driver choice:** We use **pg8000** for all direct database writes (news articles, embeddings) instead of psycopg2 because pg8000 is pure Python with no C extensions, making it compatible with Databricks Serverless compute. psycopg2-binary has native C extensions that cause kernel crashes (SIGABRT 134) on Serverless.
+# MAGIC Example:
+# MAGIC
+# MAGIC ```json
+# MAGIC {
+# MAGIC   "locations": ["Chicago, IL", "Austin, TX"],
+# MAGIC   "limit": 50
+# MAGIC }
+# MAGIC ```
+# MAGIC
+# MAGIC That endpoint stores normalized NWS alerts and forecasts in
+# MAGIC `weather_news`.
 
 # COMMAND ----------
 
-# DBTITLE 1,Parse Lakebase Connection Info
-import base64
-import re
-from urllib.parse import urlparse, quote_plus
+with lakebase.get_connection() as conn:
+    with conn.cursor() as cur:
 
-from databricks.sdk import WorkspaceClient
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {WEATHER_TABLE_NAME}
+            """
+        )
 
-w = WorkspaceClient()
+        total_documents = cur.fetchone()[0]
+
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {WEATHER_TABLE_NAME}
+            WHERE narrative_text IS NOT NULL
+              AND TRIM(narrative_text) <> ''
+            """
+        )
+
+        documents_with_text = cur.fetchone()[0]
+
+print(f"Total weather documents:       {total_documents}")
+print(f"Documents containing text:     {documents_with_text}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Find Unembedded Weather Documents
+# MAGIC
+# MAGIC A document is considered unembedded when there is no corresponding
+# MAGIC row in `weather_embeddings`.
+# MAGIC
+# MAGIC This makes the notebook safe to run repeatedly:
+# MAGIC
+# MAGIC - previously embedded documents are skipped
+# MAGIC - newly synchronized NWS documents are picked up
+# MAGIC - existing embeddings are not duplicated
+
+# COMMAND ----------
+
+with lakebase.get_connection() as conn:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+
+        cur.execute(
+            f"""
+            SELECT
+                d.id,
+                d.location,
+                d.source_type,
+                d.headline,
+                d.narrative_text,
+                d.issued_at,
+                d.effective_at
+            FROM {WEATHER_TABLE_NAME} d
+            WHERE d.narrative_text IS NOT NULL
+              AND TRIM(d.narrative_text) <> ''
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {EMBEDDINGS_TABLE_NAME} e
+                  WHERE e.document_id = d.id
+              )
+            ORDER BY d.synced_at ASC
+            """
+        )
+
+        documents = cur.fetchall()
+
+print(f"Found {len(documents)} unembedded weather documents.")
+
+if documents:
+    for document in documents[:5]:
+        print(
+            f"\nID: {document['id']}"
+            f"\nLocation: {document['location']}"
+            f"\nType: {document['source_type']}"
+            f"\nHeadline: {document['headline']}"
+            f"\nText: {document['narrative_text'][:300]}..."
+        )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Chunk Weather Narrative Text
+# MAGIC
+# MAGIC NWS narrative text is generally short, but alerts can contain substantial
+# MAGIC descriptions and instructions.
+# MAGIC
+# MAGIC We use:
+# MAGIC
+# MAGIC - `CHUNK_SIZE = 800`
+# MAGIC - `CHUNK_OVERLAP = 100`
+# MAGIC
+# MAGIC These values match the assignment recommendation.
+# MAGIC
+# MAGIC The overlap preserves some context when a sentence or concept crosses
+# MAGIC a chunk boundary.
+
+# COMMAND ----------
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
+    """Split text into overlapping character-based chunks."""
+
+    if not text:
+        return []
+
+    text = text.strip()
+
+    if not text:
+        return []
+
+    if len(text) <= chunk_size:
+        return [text]
+
+    step = chunk_size - overlap
+    chunks = []
+
+    for start in range(0, len(text), step):
+        chunk = text[start:start + chunk_size].strip()
+
+        if chunk:
+            chunks.append(chunk)
+
+        if start + chunk_size >= len(text):
+            break
+
+    return chunks
 
 
-def get_lakebase_url() -> str:
-    secret = w.secrets.get_secret(scope="database", key="lakebase-url")
-    return base64.b64decode(secret.value).decode("utf-8")
+chunk_rows = []
 
+for document in documents:
 
-lakebase_url = get_lakebase_url()
-parsed = urlparse(lakebase_url)
+    chunks = chunk_text(document["narrative_text"])
 
-# Extract project name and branch name from hostname
-# Format: ep-{branch-name}-{random}.{project-name}.{region}.cloud.databricks.com
-hostname_parts = parsed.hostname.split('.')
-if len(hostname_parts) >= 2:
-    # Extract project name (second part)
-    project_name = hostname_parts[1]
-    # Extract branch name from first part (ep-{branch-name}-{random})
-    branch_match = re.match(r'ep-([^-]+)', hostname_parts[0])
-    branch_name = branch_match.group(1) if branch_match else 'production'
+    for chunk_index, text in enumerate(chunks):
+
+        chunk_rows.append(
+            {
+                "document_id": document["id"],
+                "location": document["location"],
+                "headline": document["headline"],
+                "source_type": document["source_type"],
+                "chunk_index": chunk_index,
+                "chunk_text": text,
+            }
+        )
+
+print(f"Created {len(chunk_rows)} text chunks.")
+
+if chunk_rows:
+    print("\nSample chunk:")
+    print(chunk_rows[0])
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Load Embedding Model
+# MAGIC
+# MAGIC The same model is used by the Flask `/weather/search` endpoint.
+# MAGIC
+# MAGIC `all-MiniLM-L6-v2` produces 384-dimensional embeddings.
+
+# COMMAND ----------
+
+from sentence_transformers import SentenceTransformer
+
+print(f"Loading {EMBEDDING_MODEL_NAME}...")
+
+model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+print("Embedding model loaded successfully.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Generate Chunk Embeddings
+# MAGIC
+# MAGIC Embeddings are generated in batches to avoid unnecessarily large memory
+# MAGIC usage.
+
+# COMMAND ----------
+
+import numpy as np
+
+embedded_rows = []
+
+for start in range(0, len(chunk_rows), BATCH_SIZE):
+
+    batch = chunk_rows[start:start + BATCH_SIZE]
+
+    texts = [row["chunk_text"] for row in batch]
+
+    vectors = model.encode(
+        texts,
+        batch_size=BATCH_SIZE,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
+
+    for row, vector in zip(batch, vectors):
+
+        if len(vector) != EMBEDDING_DIM:
+            raise ValueError(
+                f"Expected {EMBEDDING_DIM}-dimensional vector but received "
+                f"{len(vector)} dimensions."
+            )
+
+        row_with_embedding = dict(row)
+        row_with_embedding["embedding"] = vector.tolist()
+
+        embedded_rows.append(row_with_embedding)
+
+    print(
+        f"Embedded {min(start + BATCH_SIZE, len(chunk_rows))}"
+        f"/{len(chunk_rows)} chunks"
+    )
+
+print(f"\nGenerated {len(embedded_rows)} embeddings.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Preview Generated Embeddings
+
+# COMMAND ----------
+
+if embedded_rows:
+
+    sample = embedded_rows[0]
+
+    print(f"Document ID: {sample['document_id']}")
+    print(f"Chunk index: {sample['chunk_index']}")
+    print(f"Chunk text:  {sample['chunk_text'][:500]}")
+    print(f"Vector dimensions: {len(sample['embedding'])}")
+    print(f"Model: {EMBEDDING_MODEL_NAME}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Write Embeddings to Lakebase
+# MAGIC
+# MAGIC The embeddings are written directly through psycopg2.
+# MAGIC
+# MAGIC The vector is passed as a PostgreSQL vector literal and explicitly cast
+# MAGIC using:
+# MAGIC
+# MAGIC ```sql
+# MAGIC %s::vector
+# MAGIC ```
+# MAGIC
+# MAGIC This avoids the Spark JDBC / pgvector issues described in the assignment.
+# MAGIC
+# MAGIC Each chunk receives a stable ID:
+# MAGIC
+# MAGIC `document_id + "_" + chunk_index`
+# MAGIC
+# MAGIC The table also has a unique constraint/primary key on `id`, allowing the
+# MAGIC notebook to be safely re-run.
+
+# COMMAND ----------
+
+from psycopg2.extras import execute_values
+from datetime import datetime, timezone
+
+if not embedded_rows:
+
+    print("No new embeddings to write.")
+
 else:
-    raise ValueError(f"Unexpected Lakebase hostname format: {parsed.hostname}")
 
-# Build JDBC URL for reading only (writes will use Lakebase SDK)
-jdbc_url = f"jdbc:postgresql://{parsed.hostname}:{parsed.port or 5432}{parsed.path}"
-print(f"Connecting to: {parsed.hostname}:{parsed.port or 5432}{parsed.path}")
-print(f"Project: {project_name}, Branch: {branch_name}")
+    insert_rows = []
 
-# Pass credentials and SSL settings in properties for JDBC reads
-jdbc_properties = {
-    "user": parsed.username,
-    "password": parsed.password,
-    "driver": "org.postgresql.Driver",
-    "sslmode": "require",
-}
+    for row in embedded_rows:
 
-db_host = parsed.hostname
-db_name = parsed.path.lstrip('/')
-print(f"Database: {db_name}")
+        embedding_id = (
+            f"{row['document_id']}_{row['chunk_index']}"
+        )
 
-# COMMAND ----------
+        vector_string = (
+            "["
+            + ",".join(str(float(value)) for value in row["embedding"])
+            + "]"
+        )
 
-# DBTITLE 1,Test pg8000 Connection
-# Test pg8000 connection
-# NOTE: Using pg8000 instead of psycopg2 for Serverless compatibility
-# - psycopg2-binary has native C extensions that crash on Serverless (SIGABRT 134)
-# - pg8000 is pure Python with no C dependencies, works reliably on Serverless
-import pg8000.native
+        insert_rows.append(
+            (
+                embedding_id,
+                row["document_id"],
+                row["chunk_index"],
+                row["chunk_text"],
+                vector_string,
+                EMBEDDING_MODEL_NAME,
+            )
+        )
 
-try:
-    # Connect using pg8000 (pure Python, works on Serverless)
-    conn = pg8000.native.Connection(
-        host=db_host,
-        port=parsed.port or 5432,
-        database=db_name,
-        user=parsed.username,
-        password=parsed.password,
-        ssl_context=True  # Equivalent to sslmode=require
-    )
-    
-    # Test query to count rows in watchlist table
-    result = conn.run(f"SELECT COUNT(*) as count FROM {WATCHLIST_TABLE_NAME}")
-    count = result[0][0] if result else 0
-    
-    print(f"✅ pg8000 connection successful! Found {count} rows in {WATCHLIST_TABLE_NAME}")
-    
-    # Show sample rows
-    if count > 0:
-        rows = conn.run(f"SELECT * FROM {WATCHLIST_TABLE_NAME} LIMIT 5")
-        print(f"\nSample rows:")
-        for row in rows:
-            print(f"  {row}")
-    
-    conn.close()
-    
-except Exception as e:
-    print(f"❌ pg8000 connection failed: {e}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Database Setup Instructions
-# MAGIC
-# MAGIC Before running this notebook, you must manually create the required tables
-# MAGIC in your Lakebase Postgres database:
-# MAGIC
-# MAGIC 1. Run `sql/01_setup_news_table.sql` to create `ticker_news_documents`
-# MAGIC 2. Run `sql/02_setup_embeddings_table.sql` to create `ticker_news_embeddings`
-# MAGIC    - Replace `{{EMBEDDING_DIM}}` with your model's dimension (e.g., 384)
-# MAGIC 3. Run `sql/03_setup_chunk_embeddings_table.sql` to create `ticker_news_chunk_embeddings`
-# MAGIC    - Replace `{{EMBEDDING_DIM}}` with your model's dimension (e.g., 384)
-# MAGIC
-# MAGIC This notebook uses **pg8000** (pure Python PostgreSQL driver) for all writes,
-# MAGIC which works reliably on Databricks Serverless compute without C extensions.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Fetch news from Massive for watchlisted tickers
-# MAGIC
-# MAGIC This ETL is now self-contained: instead of relying on the Flask app's
-# MAGIC `POST /news/sync` route to have populated `ticker_news_documents` ahead of
-# MAGIC time, the notebook queries the `watchlist` table in Lakebase directly to
-# MAGIC find out which tickers are being tracked, then pulls news for exactly
-# MAGIC those tickers from Massive itself.
-# MAGIC
-# MAGIC The free Massive API tier is rate-limited very aggressively, so requests
-# MAGIC are made **serially** (not distributed across Spark workers) with a sleep
-# MAGIC between calls that enforces `MAX_REQUESTS_PER_MINUTE` (default 5/min).
-
-# COMMAND ----------
-
-# DBTITLE 1,Fetch news and sync using Lakebase SDK
-import base64 as _b64
-import json as _json
-import time
-from datetime import datetime
-
-import requests
-from pyspark.sql.functions import col, current_timestamp, lit
-from pyspark.sql.types import StringType, StructField, StructType
-
-
-def get_massive_api_key() -> str:
-    secret = w.secrets.get_secret(scope=MASSIVE_SECRET_SCOPE, key=MASSIVE_SECRET_KEY)
-    return _b64.b64decode(secret.value).decode("utf-8")
-
-
-def get_watchlist_tickers() -> list[str]:
-    """Distinct, uppercased ticker symbols currently tracked across all users
-    in the watchlist table - these are the only tickers we fetch news for."""
-    watchlist_df = spark.read.jdbc(
-        url=jdbc_url, table=WATCHLIST_TABLE_NAME, properties=jdbc_properties
-    )
-    symbols = watchlist_df.select("symbol").distinct().collect()
-    return [row.symbol.strip().upper() for row in symbols if row.symbol]
-
-
-def fetch_news_for_ticker(session: requests.Session, ticker: str, limit: int) -> list[dict]:
-    """Single GET /v2/reference/news call for one ticker (mirrors
-    MassiveClient.get_news in massive_client.py)."""
-    resp = session.get(
-        f"{MASSIVE_API_BASE_URL}/v2/reference/news",
-        params={"ticker": ticker, "limit": limit, "order": "desc", "sort": "published_utc"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json().get("results", [])
-
-
-def sync_news_to_lakebase(ticker: str, articles: list[dict]) -> int:
-    """Convert Massive API response and insert via Lakebase SDK executeLakebasePostgresSql tool.
-    Uses ON CONFLICT DO NOTHING for automatic deduplication."""
-    if not articles:
-        return 0
-    
-    rows = []
-    for article in articles:
-        sentiment = None
-        sentiment_reasoning = None
-        for insight in article.get("insights", []) or []:
-            if insight.get("ticker") == ticker:
-                sentiment = insight.get("sentiment")
-                sentiment_reasoning = insight.get("sentiment_reasoning")
-                break
-
-        publisher = article.get("publisher") or {}
-        rows.append({
-            "id": str(article.get("id")),
-            "ticker": ticker,
-            "title": article.get("title", ""),
-            "description": article.get("description"),
-            "author": article.get("author"),
-            "article_url": article.get("article_url"),
-            "publisher_name": publisher.get("name"),
-            "keywords": _json.dumps(article.get("keywords", [])),
-            "sentiment": sentiment,
-            "sentiment_reasoning": sentiment_reasoning,
-            "published_utc": article.get("published_utc"),
-            "payload": _json.dumps(article),
-        })
-
-    # We'll collect these rows and write them via the assistant's executeLakebasePostgresSql tool
-    # Store in a global so the next cell can access them
-    return rows
-
-
-print("NOTE: Before running this cell, ensure you've run sql/01_setup_news_table.sql")
-print("      to create the ticker_news_documents table in your Lakebase database.\n")
-
-tickers = get_watchlist_tickers()
-print(f"Found {len(tickers)} distinct watchlisted tickers: {tickers}")
-
-# Enforce MAX_REQUESTS_PER_MINUTE by spacing calls evenly across a minute -
-# e.g. 5/min -> one request every 12s. Sleeping BEFORE each call after the
-# first keeps this correct even if a single request itself takes a while.
-_seconds_between_requests = 60.0 / MAX_REQUESTS_PER_MINUTE
-
-_massive_session = requests.Session()
-_massive_session.headers.update(
-    {"Authorization": f"Bearer {get_massive_api_key()}", "Content-Type": "application/json"}
-)
-
-news_synced = 0
-all_news_rows = []  # Collect all rows to insert via Lakebase SDK
-for i, ticker in enumerate(tickers):
-    if i > 0:
-        time.sleep(_seconds_between_requests)
-    try:
-        articles = fetch_news_for_ticker(_massive_session, ticker, NEWS_FETCH_LIMIT)
-        batch_rows = sync_news_to_lakebase(ticker, articles)
-        if batch_rows:
-            all_news_rows.extend(batch_rows)
-    except Exception as exc:
-        print(f"Skipping {ticker}: failed to fetch/sync news ({exc})")
-        continue
-
-print(f"\nCollected {len(all_news_rows)} news articles to insert via Lakebase SDK.")
-print(f"Run the next cell to insert them using executeLakebasePostgresSql tool.")
-
-# COMMAND ----------
-
-# DBTITLE 1,Insert collected news articles using pg8000
-# NOTE: Using pg8000 instead of psycopg2 for Serverless compatibility
-# - psycopg2-binary has native C extensions that crash on Serverless (SIGABRT 134)
-# - pg8000 is pure Python with no C dependencies, works reliably on Serverless
-# - Both libraries provide the same PostgreSQL connectivity
-import pg8000.native
-
-# Check if required variables exist (kernel may have restarted)
-try:
-    _ = all_news_rows
-    _ = NEWS_TABLE_NAME
-    _ = db_host
-    _ = parsed
-    _ = db_name
-except NameError as e:
-    raise RuntimeError(
-        f"Required variable {e.name!r} not defined. " +
-        "The kernel may have been restarted. " +
-        "Please re-run cells 3, 5, and 9 before running this cell."
-    ) from e
-
-print(f"Inserting {len(all_news_rows)} news articles into {NEWS_TABLE_NAME}...")
-
-# Connect using pg8000 (pure Python, works on Serverless)
-conn = pg8000.native.Connection(
-    host=db_host,
-    port=parsed.port or 5432,
-    database=db_name,
-    user=parsed.username,
-    password=parsed.password,
-    ssl_context=True  # Equivalent to sslmode=require
-)
-
-try:
-    # Prepare batch insert with ON CONFLICT DO NOTHING for deduplication
-    # Use RETURNING to count actual inserts (conflicts return empty)
     insert_sql = f"""
-        INSERT INTO {NEWS_TABLE_NAME} (
-            id, ticker, title, description, author, article_url, publisher_name,
-            keywords, sentiment, sentiment_reasoning, published_utc, payload, synced_at
-        ) VALUES (:id, :ticker, :title, :description, :author, :article_url, :publisher_name,
-                  :keywords, :sentiment, :sentiment_reasoning, :published_utc, :payload, CURRENT_TIMESTAMP)
-        ON CONFLICT (id) DO NOTHING
-        RETURNING id
+        INSERT INTO {EMBEDDINGS_TABLE_NAME} (
+            id,
+            document_id,
+            chunk_index,
+            chunk_text,
+            embedding,
+            model_name,
+            created_at
+        )
+        VALUES %s
+        ON CONFLICT (id) DO UPDATE
+        SET
+            document_id = EXCLUDED.document_id,
+            chunk_index = EXCLUDED.chunk_index,
+            chunk_text = EXCLUDED.chunk_text,
+            embedding = EXCLUDED.embedding,
+            model_name = EXCLUDED.model_name,
+            created_at = EXCLUDED.created_at
     """
-    
-    # pg8000 doesn't have execute_values, so we use executemany-style batching
-    inserted_count = 0
-    for row in all_news_rows:
-        result = conn.run(insert_sql, **row)
-        # RETURNING returns a list of tuples; if non-empty, row was inserted
-        if result:  
-            inserted_count += 1
-    
-    print(f"✅ Successfully inserted {inserted_count} new news articles")
-    print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
-    
-finally:
-    conn.close()
 
-print(f"\nReady to compute embeddings! Run the cells below to continue.")
+    template = """
+        (
+            %s,
+            %s,
+            %s,
+            %s,
+            %s::vector,
+            %s,
+            now()
+        )
+    """
 
-# COMMAND ----------
+    total_written = 0
 
-# MAGIC %md
-# MAGIC ## Load raw news documents with Spark
-# MAGIC
-# MAGIC Reads the whole `ticker_news_documents` table (just synced from Massive
-# MAGIC above) via JDBC into a Spark DataFrame so embedding computation can be
-# MAGIC distributed across the cluster.
+    with lakebase.get_connection() as conn:
 
-# COMMAND ----------
+        with conn.cursor() as cur:
 
-news_df = (
-    spark.read.jdbc(url=jdbc_url, table=NEWS_TABLE_NAME, properties=jdbc_properties)
-    .selectExpr(
-        "id",
-        "ticker",
-        "title",
-        "description",
-        "article_url",
-        "published_utc",
-        # Embed on title + description together for richer context.
-        "trim(concat(coalesce(title, ''), '. ', coalesce(description, ''))) AS embedding_text",
+            for start in range(0, len(insert_rows), BATCH_SIZE):
+
+                batch = insert_rows[start:start + BATCH_SIZE]
+
+                execute_values(
+                    cur,
+                    insert_sql,
+                    batch,
+                    template=template,
+                    page_size=BATCH_SIZE,
+                )
+
+                total_written += len(batch)
+
+                print(
+                    f"Wrote {min(start + BATCH_SIZE, len(insert_rows))}"
+                    f"/{len(insert_rows)} embeddings"
+                )
+
+        conn.commit()
+
+    print(
+        f"\nSuccessfully wrote {total_written} embeddings "
+        f"to {EMBEDDINGS_TABLE_NAME}."
     )
-    .filter("embedding_text IS NOT NULL AND embedding_text != ''")
-)
-
-print(f"Loaded {news_df.count()} news documents from {NEWS_TABLE_NAME}")
-display(news_df.limit(5))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Compute embeddings (distributed pandas UDF)
+# MAGIC ## Verify Embeddings
 # MAGIC
-# MAGIC Loads the sentence-transformers model once per executor process (not per
-# MAGIC row) and applies it in batches via `mapInPandas`, which scales across
-# MAGIC however many workers the cluster has.
+# MAGIC Confirm that the embedding column is actually PostgreSQL's `vector`
+# MAGIC type rather than a text or array column.
 
 # COMMAND ----------
 
-# DBTITLE 1,Compute embeddings (distributed pandas UDF)
-from typing import Iterator
+with lakebase.get_connection() as conn:
 
-import pandas as pd
-from pyspark.sql.types import ArrayType, FloatType, StringType, StructField, StructType
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
-embeddings_schema = StructType(
-    [
-        StructField("id", StringType(), False),
-        StructField("ticker", StringType(), False),
-        StructField("title", StringType(), False),
-        StructField("published_utc", StringType(), True),
-        StructField("embedding", ArrayType(FloatType()), False),
-    ]
-)
-
-
-def embed_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
-    """Runs once per Spark partition/task: load the model once, then embed
-    every batch of rows handed to this partition."""
-    import os
-    from sentence_transformers import SentenceTransformer
-
-    os.environ["HF_HOME"] = "/tmp/.cache/huggingface"
-    os.environ["TRANSFORMERS_CACHE"] = "/tmp/.cache/huggingface"
-    os.environ["HF_HUB_CACHE"] = "/tmp/.cache/huggingface"
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder="/tmp/.cache/huggingface")
-
-    for batch in iterator:
-        vectors = model.encode(batch["embedding_text"].tolist(), show_progress_bar=False)
-        yield pd.DataFrame(
-            {
-                "id": batch["id"],
-                "ticker": batch["ticker"],
-                "title": batch["title"],
-                "published_utc": batch["published_utc"].astype(str),
-                "embedding": [v.tolist() for v in vectors],
-            }
+        cur.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total_embeddings,
+                COUNT(DISTINCT document_id) AS documents_embedded
+            FROM {EMBEDDINGS_TABLE_NAME}
+            """
         )
 
+        counts = cur.fetchone()
 
-embeddings_df = news_df.mapInPandas(embed_partitions, schema=embeddings_schema)
+        cur.execute(
+            """
+            SELECT
+                column_name,
+                data_type,
+                udt_name
+            FROM information_schema.columns
+            WHERE table_name = %s
+              AND column_name = 'embedding'
+            """,
+            (EMBEDDINGS_TABLE_NAME,),
+        )
 
-print(f"Computed {embeddings_df.count()} embeddings using {EMBEDDING_MODEL_NAME}")
+        embedding_column = cur.fetchone()
 
-# COMMAND ----------
+print(f"Total embeddings:       {counts['total_embeddings']}")
+print(f"Documents embedded:     {counts['documents_embedded']}")
 
-# MAGIC %md
-# MAGIC ## Ensure the pgvector destination table exists
-# MAGIC
-# MAGIC `pgvector` isn't a JDBC-native type, but plain SQL text (`vector(N)`,
-# MAGIC `::vector` casts) works fine over pg8000's native connection.
-
-# COMMAND ----------
-
-# Before running the cells below, ensure you've manually run:
-#   sql/02_setup_embeddings_table.sql
-# Replace {{EMBEDDING_DIM}} in that file with the value below:
-print(f"Required EMBEDDING_DIM for SQL setup: {EMBEDDING_DIM}")
-print(f"Table name: {EMBEDDINGS_TABLE_NAME}")
-print("\nRun sql/02_setup_embeddings_table.sql in your Lakebase database before continuing.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Upsert embeddings into Lakebase
-# MAGIC
-# MAGIC Writes directly to Postgres using **pg8000** (pure Python driver, no C extensions).
-# MAGIC We use pg8000 instead of psycopg2 because it works reliably on Databricks Serverless compute, whereas psycopg2-binary's C extensions cause kernel crashes.
-# MAGIC
-# MAGIC Each embedding is cast to Postgres' `vector` type via `::vector`.
-
-# COMMAND ----------
-
-# DBTITLE 1,Insert embeddings using pg8000
-# NOTE: Using pg8000 instead of psycopg2 for Serverless compatibility
-# - psycopg2-binary has native C extensions that crash on Serverless (SIGABRT 134)
-# - pg8000 is pure Python with no C dependencies, works reliably on Serverless
-import pg8000.native
-from pyspark.sql.functions import current_timestamp, lit
-
-# Add model_name and embedded_at columns
-embeddings_with_meta = embeddings_df.withColumn("model_name", lit(EMBEDDING_MODEL_NAME)).withColumn(
-    "embedded_at", current_timestamp()
-)
-
-# Collect embeddings to driver
-embeddings_rows = embeddings_with_meta.collect()
-
-if len(embeddings_rows) > 0:
-    print(f"Inserting {len(embeddings_rows)} embeddings into {EMBEDDINGS_TABLE_NAME}...")
-    
-    # Connect using pg8000 (pure Python, works on Serverless)
-    conn = pg8000.native.Connection(
-        host=db_host,
-        port=parsed.port or 5432,
-        database=db_name,
-        user=parsed.username,
-        password=parsed.password,
-        ssl_context=True
+if embedding_column:
+    print(
+        f"Embedding data type:    {embedding_column['data_type']}"
     )
-    
-    try:
-        # Batch insert with ON CONFLICT DO NOTHING for deduplication
-        # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
-        # Use RETURNING to count actual inserts (conflicts return empty)
-        insert_sql = f"""
-            INSERT INTO {EMBEDDINGS_TABLE_NAME} (
-                id, ticker, title, published_utc, embedding, model_name, embedded_at
-            ) VALUES (:id, :ticker, :title, :published_utc, :embedding::double precision[], :model_name, :embedded_at)
-            ON CONFLICT (id) DO NOTHING
-            RETURNING id
-        """
-        
-        inserted_count = 0
-        for row in embeddings_rows:
-            # Format embedding as PostgreSQL array literal
-            embedding_str = '{' + ','.join(str(float(x)) for x in row.embedding) + '}'
-            result = conn.run(
-                insert_sql,
-                id=row.id,
-                ticker=row.ticker,
-                title=row.title,
-                published_utc=str(row.published_utc) if row.published_utc else None,
-                embedding=embedding_str,
-                model_name=row.model_name,
-                embedded_at=row.embedded_at
+    print(
+        f"Embedding UDT:          {embedding_column['udt_name']}"
+    )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Test Cosine Similarity Search
+# MAGIC
+# MAGIC This is a small validation query to confirm the pgvector column and HNSW
+# MAGIC index are usable.
+# MAGIC
+# MAGIC The production version of this logic lives in:
+# MAGIC
+# MAGIC `POST /weather/search`
+# MAGIC
+# MAGIC The Flask endpoint embeds the user's query with the same model and uses
+# MAGIC pgvector's cosine-distance operator (`<=>`).
+
+# COMMAND ----------
+
+if embedded_rows:
+
+    test_vector = embedded_rows[0]["embedding"]
+
+    test_vector_string = (
+        "["
+        + ",".join(str(float(value)) for value in test_vector)
+        + "]"
+    )
+
+    with lakebase.get_connection() as conn:
+
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+
+            cur.execute(
+                f"""
+                SELECT
+                    e.id,
+                    e.document_id,
+                    e.chunk_index,
+                    e.chunk_text,
+                    1 - (
+                        e.embedding <=> %s::vector
+                    ) AS similarity
+                FROM {EMBEDDINGS_TABLE_NAME} e
+                ORDER BY e.embedding <=> %s::vector
+                LIMIT 5
+                """,
+                (
+                    test_vector_string,
+                    test_vector_string,
+                ),
             )
-            if result:
-                inserted_count += 1
-        
-        print(f"✅ Successfully inserted {inserted_count} new embeddings")
-        print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
-        print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
-        print(f"  UPDATE {EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector WHERE embedding IS NOT NULL;")
-        
-    finally:
-        conn.close()
-else:
-    print("No embeddings to write.")
 
-# COMMAND ----------
+            results = cur.fetchall()
 
-# MAGIC %md
-# MAGIC ## Fetch and chunk article content
-# MAGIC
-# MAGIC Title/description only gets you so far - the actual article body lives at
-# MAGIC `article_url` on the publisher's site. This step fetches each URL, uses
-# MAGIC `trafilatura` to extract just the article text (stripping nav/ads/related
-# MAGIC links/etc.), and splits it into overlapping chunks so each chunk can be
-# MAGIC embedded and retrieved independently. Fetching is distributed across the
-# MAGIC cluster via `mapInPandas`; any URL that fails to fetch/extract (paywall,
-# MAGIC timeout, dead link) is skipped rather than failing the whole job.
+    print("Top 5 similarity results:\n")
 
-# COMMAND ----------
+    for result in results:
 
-content_df = news_df.select("id", "ticker", "article_url").filter(
-    "article_url IS NOT NULL AND article_url != ''"
-)
-
-chunks_schema = StructType(
-    [
-        StructField("article_id", StringType(), False),
-        StructField("ticker", StringType(), False),
-        StructField("chunk_index", StringType(), False),
-        StructField("chunk_text", StringType(), False),
-    ]
-)
-
-
-def fetch_and_chunk_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
-    """Runs once per Spark partition/task: fetch each article's HTML, extract
-    the main body text with trafilatura, then split it into overlapping
-    chunks of CHUNK_SIZE characters (CHUNK_OVERLAP characters shared between
-    consecutive chunks so context isn't lost at chunk boundaries)."""
-    import requests
-    import trafilatura
-
-    for batch in iterator:
-        out_article_ids, out_tickers, out_chunk_indexes, out_chunk_texts = [], [], [], []
-        for article_id, ticker, article_url in zip(
-            batch["id"], batch["ticker"], batch["article_url"]
-        ):
-            try:
-                resp = requests.get(article_url, timeout=15)
-                resp.raise_for_status()
-                text = trafilatura.extract(resp.text)
-            except Exception:
-                # Dead link, paywall, timeout, etc. - skip this article's
-                # content chunks rather than failing the whole job.
-                continue
-
-            if not text:
-                continue
-
-            for chunk_index, start in enumerate(range(0, len(text), CHUNK_SIZE - CHUNK_OVERLAP)):
-                chunk_text = text[start : start + CHUNK_SIZE].strip()
-                if not chunk_text:
-                    continue
-                out_article_ids.append(article_id)
-                out_tickers.append(ticker)
-                out_chunk_indexes.append(str(chunk_index))
-                out_chunk_texts.append(chunk_text)
-                if start + CHUNK_SIZE >= len(text):
-                    break
-
-        yield pd.DataFrame(
-            {
-                "article_id": out_article_ids,
-                "ticker": out_tickers,
-                "chunk_index": out_chunk_indexes,
-                "chunk_text": out_chunk_texts,
-            }
+        print(
+            f"Similarity: {result['similarity']:.4f}"
         )
-
-
-chunks_df = content_df.mapInPandas(fetch_and_chunk_partitions, schema=chunks_schema)
-
-print(f"Extracted {chunks_df.count()} content chunks from {content_df.count()} article URLs")
-display(chunks_df.limit(5))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Compute chunk embeddings
-# MAGIC
-# MAGIC Same approach as the title/description embeddings above, but one vector
-# MAGIC per content chunk instead of per article.
-
-# COMMAND ----------
-
-chunk_embeddings_schema = StructType(
-    [
-        StructField("article_id", StringType(), False),
-        StructField("ticker", StringType(), False),
-        StructField("chunk_index", StringType(), False),
-        StructField("chunk_text", StringType(), False),
-        StructField("embedding", ArrayType(FloatType()), False),
-    ]
-)
-
-
-def embed_chunk_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
-    """Runs once per Spark partition: load the model once, then embed
-    every batch of chunks handed to this partition."""
-    import os
-    from sentence_transformers import SentenceTransformer
-
-    os.environ["HF_HOME"] = "/tmp/.cache/huggingface"
-    os.environ["TRANSFORMERS_CACHE"] = "/tmp/.cache/huggingface"
-    os.environ["HF_HUB_CACHE"] = "/tmp/.cache/huggingface"
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder="/tmp/.cache/huggingface")
-
-    for batch in iterator:
-        vectors = model.encode(batch["chunk_text"].tolist(), show_progress_bar=False)
-        yield pd.DataFrame(
-            {
-                "article_id": batch["article_id"],
-                "ticker": batch["ticker"],
-                "chunk_index": batch["chunk_index"],
-                "chunk_text": batch["chunk_text"],
-                "embedding": [v.tolist() for v in vectors],
-            }
+        print(
+            f"Document:   {result['document_id']}"
         )
+        print(
+            f"Chunk:      {result['chunk_index']}"
+        )
+        print(
+            f"Text:       {result['chunk_text'][:300]}"
+        )
+        print("-" * 80)
 
-
-chunk_embeddings_df = chunks_df.mapInPandas(embed_chunk_partitions, schema=chunk_embeddings_schema)
-
-print(f"Computed {chunk_embeddings_df.count()} chunk embeddings using {EMBEDDING_MODEL_NAME}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Ensure the chunk embeddings destination table exists
-
-# COMMAND ----------
-
-# Before running the cells below, ensure you've manually run:
-#   sql/03_setup_chunk_embeddings_table.sql
-# Replace {{EMBEDDING_DIM}} in that file with the value below:
-print(f"Required EMBEDDING_DIM for SQL setup: {EMBEDDING_DIM}")
-print(f"Table name: {CHUNK_EMBEDDINGS_TABLE_NAME}")
-print("\nRun sql/03_setup_chunk_embeddings_table.sql in your Lakebase database before continuing.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Upsert chunk embeddings into Lakebase
-# MAGIC
-# MAGIC Writes directly to Postgres using **pg8000** (pure Python driver, no C extensions).
-# MAGIC We use pg8000 instead of psycopg2 because it works reliably on Databricks Serverless compute, whereas psycopg2-binary's C extensions cause kernel crashes.
-
-# COMMAND ----------
-
-# DBTITLE 1,Insert chunk embeddings using psycopg2
-# NOTE: Using pg8000 instead of psycopg2 for Serverless compatibility
-# - psycopg2-binary has native C extensions that crash on Serverless (SIGABRT 134)
-# - pg8000 is pure Python with no C dependencies, works reliably on Serverless
-import pg8000.native
-from pyspark.sql.functions import col, current_timestamp, expr, lit
-
-# Add id (article_id_chunk_index), model_name, and embedded_at columns
-chunk_embeddings_with_meta = (
-    chunk_embeddings_df.withColumn(
-        "id", expr("concat(article_id, '_', chunk_index)")
-    )
-    .withColumn("model_name", lit(EMBEDDING_MODEL_NAME))
-    .withColumn("embedded_at", current_timestamp())
-    .withColumn("chunk_index", col("chunk_index").cast("int"))
-)
-
-# Collect chunk embeddings to driver
-chunk_embeddings_rows = chunk_embeddings_with_meta.collect()
-
-if len(chunk_embeddings_rows) > 0:
-    print(f"Inserting {len(chunk_embeddings_rows)} chunk embeddings into {CHUNK_EMBEDDINGS_TABLE_NAME}...")
-    
-    # Connect using pg8000 (pure Python, works on Serverless)
-    conn = pg8000.native.Connection(
-        host=db_host,
-        port=parsed.port or 5432,
-        database=db_name,
-        user=parsed.username,
-        password=parsed.password,
-        ssl_context=True
-    )
-    
-    try:
-        # Batch insert with ON CONFLICT DO NOTHING for deduplication
-        # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
-        # Use RETURNING to count actual inserts (conflicts return empty)
-        insert_sql = f"""
-            INSERT INTO {CHUNK_EMBEDDINGS_TABLE_NAME} (
-                id, article_id, ticker, chunk_index, chunk_text, embedding, model_name, embedded_at
-            ) VALUES (:id, :article_id, :ticker, :chunk_index, :chunk_text, :embedding::double precision[], :model_name, :embedded_at)
-            ON CONFLICT (id) DO NOTHING
-            RETURNING id
-        """
-        
-        inserted_count = 0
-        for row in chunk_embeddings_rows:
-            # Format embedding as PostgreSQL array literal
-            embedding_str = '{' + ','.join(str(float(x)) for x in row.embedding) + '}'
-            result = conn.run(
-                insert_sql,
-                id=row.id,
-                article_id=row.article_id,
-                ticker=row.ticker,
-                chunk_index=int(row.chunk_index),
-                chunk_text=row.chunk_text,
-                embedding=embedding_str,
-                model_name=row.model_name,
-                embedded_at=row.embedded_at
-            )
-            if result:
-                inserted_count += 1
-        
-        print(f"✅ Successfully inserted {inserted_count} new chunk embeddings")
-        print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
-        print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
-        print(f"  UPDATE {CHUNK_EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector WHERE embedding IS NOT NULL;")
-        
-    finally:
-        conn.close()
 else:
-    print("No chunk embeddings to write.")
+
+    print(
+        "No embeddings available for similarity test."
+    )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Pipeline Complete
+# MAGIC
+# MAGIC The weather embedding pipeline is now:
+# MAGIC
+# MAGIC ```text
+# MAGIC National Weather Service API
+# MAGIC             |
+# MAGIC             v
+# MAGIC       /weather/sync
+# MAGIC             |
+# MAGIC             v
+# MAGIC       weather_news
+# MAGIC             |
+# MAGIC             v
+# MAGIC   ingest_weather_embeddings
+# MAGIC             |
+# MAGIC      chunk narrative_text
+# MAGIC             |
+# MAGIC     all-MiniLM-L6-v2
+# MAGIC             |
+# MAGIC             v
+# MAGIC     weather_embeddings
+# MAGIC             |
+# MAGIC       pgvector / HNSW
+# MAGIC             |
+# MAGIC             v
+# MAGIC       /weather/search
+# MAGIC ```
+# MAGIC
+# MAGIC Example search:
+# MAGIC
+# MAGIC ```json
+# MAGIC {
+# MAGIC   "query": "flash flood risk this weekend",
+# MAGIC   "top_k": 5
+# MAGIC }
+# MAGIC ```
+# MAGIC
+# MAGIC The Flask API should return the most semantically relevant weather
+# MAGIC chunks ranked using cosine similarity.
