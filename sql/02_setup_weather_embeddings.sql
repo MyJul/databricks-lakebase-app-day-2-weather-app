@@ -1,9 +1,14 @@
 -- Setup script for weather_embeddings table
 -- Run this manually in your Lakebase Postgres database before running the notebook
--- Replace {{EMBEDDING_DIM}} with your model's dimension (e.g., 384 for all-MiniLM-L6-v2)
+-- Requires pgvector extension
 
+-- Enable pgvector extension (if not already enabled)
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Create the weather_embeddings table
+-- Uses composite TEXT id (document_id_chunk_index) for idempotent inserts
 CREATE TABLE IF NOT EXISTS weather_embeddings (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     document_id TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
     chunk_text TEXT NOT NULL,
