@@ -11,21 +11,17 @@
 # MAGIC
 # MAGIC It:
 # MAGIC
-# MAGIC 1. Reads weather documents previously harvested from the National Weather
-# MAGIC    Service (NWS) API and stored in the `weather_news` Lakebase table.
-# MAGIC 2. Finds documents that do not yet have embeddings.
+# MAGIC 1. Reads weather documents harvested by the Flask application's
+# MAGIC    `/weather/sync` endpoint from the `weather_news` Lakebase table.
+# MAGIC 2. Finds weather documents that do not yet have embeddings.
 # MAGIC 3. Splits each document's `narrative_text` into overlapping chunks.
 # MAGIC 4. Embeds each chunk using
 # MAGIC    `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions).
-# MAGIC 5. Writes the chunk embeddings directly to Lakebase using pg8000.
+# MAGIC 5. Writes embeddings directly to Lakebase using `pg8000`.
 # MAGIC 6. Stores embeddings in a pgvector `VECTOR(384)` column.
-# MAGIC 7. Creates an HNSW cosine-similarity index for vector search.
-# MAGIC 8. Validates the resulting embeddings with a cosine similarity query.
+# MAGIC 7. Verifies cosine-similarity search against the resulting embeddings.
 # MAGIC
-# MAGIC The Flask application's `/weather/sync` endpoint is responsible for
-# MAGIC harvesting NWS data and populating `weather_news`.
-# MAGIC
-# MAGIC The resulting pipeline is:
+# MAGIC The pipeline is:
 # MAGIC
 # MAGIC NWS API
 # MAGIC   -> /weather/sync
@@ -34,16 +30,28 @@
 # MAGIC   -> weather_embeddings
 # MAGIC   -> /weather/search
 # MAGIC
-# MAGIC IMPORTANT:
+# MAGIC ## Lakebase authentication
 # MAGIC
-# MAGIC This notebook intentionally does NOT use psycopg2 or Spark JDBC.
+# MAGIC This notebook intentionally does NOT use psycopg2.
 # MAGIC
-# MAGIC PostgreSQL/Lakebase connections are made with pg8000, a pure-Python
-# MAGIC PostgreSQL driver that avoids native C-extension issues on Databricks
-# MAGIC Serverless compute.
+# MAGIC `psycopg2-binary` contains native C extensions that can cause
+# MAGIC SIGABRT/kernel crashes on Databricks Serverless compute.
 # MAGIC
-# MAGIC Authentication uses a fresh Lakebase OAuth database credential generated
-# MAGIC through the Databricks SDK.
+# MAGIC Instead, this notebook uses:
+# MAGIC
+# MAGIC - `pg8000` for PostgreSQL connectivity
+# MAGIC - the Databricks SDK to generate a fresh Lakebase OAuth database
+# MAGIC   credential for each connection
+# MAGIC - the existing `database/lakebase-url` secret for connection metadata
+# MAGIC
+# MAGIC Lakebase database credentials are short-lived, so the notebook does not
+# MAGIC treat the password contained in the stored URL as a long-lived credential.
+# MAGIC
+# MAGIC The current Databricks SDK pattern is:
+# MAGIC
+# MAGIC `WorkspaceClient().postgres.generate_database_credential(...)`
+# MAGIC
+# MAGIC and the returned token is supplied to PostgreSQL as the password.
 
 # COMMAND ----------
 
@@ -52,12 +60,10 @@
 # MAGIC
 # MAGIC Required packages:
 # MAGIC
-# MAGIC - pg8000: Pure-Python PostgreSQL/Lakebase driver
-# MAGIC - sentence-transformers: Text embedding model
-# MAGIC - databricks-sdk: Generates fresh Lakebase OAuth database credentials
+# MAGIC - `pg8000`: pure-Python PostgreSQL driver
+# MAGIC - `sentence-transformers`: text embedding model
 # MAGIC
-# MAGIC The NWS API itself is called by the Flask application's
-# MAGIC `weather_client.py`, not by this notebook.
+# MAGIC We intentionally do NOT install psycopg2 or psycopg2-binary.
 
 # COMMAND ----------
 
@@ -74,7 +80,7 @@ dbutils.library.restartPython()
 # MAGIC ## Configuration
 # MAGIC
 # MAGIC These widgets allow the notebook to be run manually or scheduled as a
-# MAGIC Databricks Job without changing the source code.
+# MAGIC Databricks Job without modifying the notebook source.
 
 # COMMAND ----------
 
@@ -114,59 +120,47 @@ dbutils.widgets.text(
     "Embedding/write batch size"
 )
 
-# Lakebase connection settings.
+dbutils.widgets.text(
+    "lakebase_secret_scope",
+    "database",
+    "Lakebase secret scope"
+)
+
+dbutils.widgets.text(
+    "lakebase_secret_key",
+    "lakebase-url",
+    "Lakebase URL secret key"
+)
+
+# Optional override.
 #
-# These defaults match the Lakebase endpoint currently being used by the
-# weather application. They can be overridden when the notebook is run as
-# a Databricks Job.
-
-dbutils.widgets.text(
-    "db_host",
-    "ep-muddy-hat-d8d8gsj6.database.us-east-2.cloud.databricks.com",
-    "Lakebase PostgreSQL host"
-)
-
-dbutils.widgets.text(
-    "db_port",
-    "5432",
-    "Lakebase PostgreSQL port"
-)
-
-dbutils.widgets.text(
-    "db_name",
-    "databricks_postgres",
-    "Lakebase database"
-)
-
-dbutils.widgets.text(
-    "db_user",
-    "student",
-    "Lakebase PostgreSQL user/role"
-)
-
+# Leave blank to derive the endpoint from the Lakebase hostname.
+#
+# Example:
+# projects/dataexpert-student/branches/production/endpoints/primary
+#
 dbutils.widgets.text(
     "lakebase_endpoint",
-    "projects/dataexpert-student/branches/production/endpoints/primary",
-    "Lakebase endpoint resource"
+    "",
+    "Lakebase endpoint resource name (optional)"
 )
 
 WEATHER_TABLE_NAME = dbutils.widgets.get("weather_table_name")
 EMBEDDINGS_TABLE_NAME = dbutils.widgets.get("embeddings_table_name")
-
 EMBEDDING_MODEL_NAME = dbutils.widgets.get("embedding_model")
 
 CHUNK_SIZE = int(dbutils.widgets.get("chunk_size"))
 CHUNK_OVERLAP = int(dbutils.widgets.get("chunk_overlap"))
 BATCH_SIZE = int(dbutils.widgets.get("batch_size"))
 
-DB_HOST = dbutils.widgets.get("db_host")
-DB_PORT = int(dbutils.widgets.get("db_port"))
-DB_NAME = dbutils.widgets.get("db_name")
-DB_USER = dbutils.widgets.get("db_user")
+LAKEBASE_SECRET_SCOPE = dbutils.widgets.get("lakebase_secret_scope")
+LAKEBASE_SECRET_KEY = dbutils.widgets.get("lakebase_secret_key")
 
-LAKEBASE_ENDPOINT = dbutils.widgets.get("lakebase_endpoint")
+LAKEBASE_ENDPOINT_OVERRIDE = dbutils.widgets.get(
+    "lakebase_endpoint"
+).strip()
 
-# The assignment specifies all-MiniLM-L6-v2 / 384 dimensions.
+# The weather assignment specifies this model.
 if EMBEDDING_MODEL_NAME == "sentence-transformers/all-MiniLM-L6-v2":
     EMBEDDING_DIM = 384
 else:
@@ -192,51 +186,211 @@ print(f"Weather document table: {WEATHER_TABLE_NAME}")
 print(f"Embedding table:        {EMBEDDINGS_TABLE_NAME}")
 print(f"Embedding model:        {EMBEDDING_MODEL_NAME}")
 print(f"Embedding dimensions:   {EMBEDDING_DIM}")
-print(f"Chunk size:              {CHUNK_SIZE}")
-print(f"Chunk overlap:           {CHUNK_OVERLAP}")
-print(f"Batch size:              {BATCH_SIZE}")
-print()
-print(f"Lakebase host:           {DB_HOST}")
-print(f"Lakebase port:           {DB_PORT}")
-print(f"Lakebase database:       {DB_NAME}")
-print(f"Lakebase user:           {DB_USER}")
-print(f"Lakebase endpoint:       {LAKEBASE_ENDPOINT}")
+print(f"Chunk size:             {CHUNK_SIZE}")
+print(f"Chunk overlap:          {CHUNK_OVERLAP}")
+print(f"Batch size:             {BATCH_SIZE}")
+print(f"Secret scope:           {LAKEBASE_SECRET_SCOPE}")
+print(f"Secret key:             {LAKEBASE_SECRET_KEY}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Lakebase Connection
-# MAGIC
-# MAGIC Lakebase authentication uses a fresh OAuth database credential generated
-# MAGIC through the Databricks SDK.
-# MAGIC
-# MAGIC The generated database credential is used as the PostgreSQL password.
-# MAGIC
-# MAGIC A fresh credential is generated whenever `get_connection()` opens a new
-# MAGIC PostgreSQL connection. This avoids relying on an expired credential stored
-# MAGIC in a Databricks secret.
-# MAGIC
-# MAGIC pg8000 is used instead of psycopg2 because pg8000 is pure Python and does
-# MAGIC not depend on the native PostgreSQL C extensions that can cause problems
-# MAGIC on Databricks Serverless compute.
+# MAGIC ## Imports
 
 # COMMAND ----------
 
-from databricks.sdk import WorkspaceClient
+import base64
+import re
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
 import pg8000.native
 
-# Databricks SDK client.
-#
-# In a Databricks notebook, WorkspaceClient() uses the notebook's available
-# Databricks authentication context.
+from databricks.sdk import WorkspaceClient
+
+from sentence_transformers import SentenceTransformer
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Resolve Lakebase Connection Metadata
+# MAGIC
+# MAGIC The existing application secret is:
+# MAGIC
+# MAGIC `database/lakebase-url`
+# MAGIC
+# MAGIC The setup script stores the Lakebase connection URL in that secret:
+# MAGIC
+# MAGIC `postgresql://role:password@host:5432/database?...`
+# MAGIC
+# MAGIC
+# MAGIC We use the URL for:
+# MAGIC
+# MAGIC - host
+# MAGIC - port
+# MAGIC - database
+# MAGIC - database username
+# MAGIC
+# MAGIC However, we do NOT use the password from the URL.
+# MAGIC
+# MAGIC Instead, the password is replaced with a freshly generated OAuth
+# MAGIC database credential from the Databricks SDK.
+
+# COMMAND ----------
+
+# DBTITLE 1,Read Lakebase URL from Databricks Secret
+
 w = WorkspaceClient()
 
 
-def generate_database_credential():
+def get_lakebase_url() -> str:
     """
-    Generate a fresh Lakebase OAuth database credential.
+    Read the existing Lakebase URL from the Databricks secret.
 
-    The returned token is used as the PostgreSQL password.
+    The setup script stores this value in:
+        scope = database
+        key   = lakebase-url
+    """
+
+    secret = w.secrets.get_secret(
+        scope=LAKEBASE_SECRET_SCOPE,
+        key=LAKEBASE_SECRET_KEY,
+    )
+
+    if not secret.value:
+        raise ValueError(
+            f"Secret {LAKEBASE_SECRET_SCOPE}/{LAKEBASE_SECRET_KEY} "
+            "exists but contains no value."
+        )
+
+    # Databricks secrets are commonly returned base64 encoded.
+    try:
+        decoded = base64.b64decode(secret.value).decode("utf-8")
+
+        if decoded.startswith("postgresql://"):
+            return decoded
+
+    except Exception:
+        pass
+
+    # Fall back to treating the returned value as the URL itself.
+    if secret.value.startswith("postgresql://"):
+        return secret.value
+
+    raise ValueError(
+        "The Lakebase secret does not contain a valid PostgreSQL URL."
+    )
+
+
+lakebase_url = get_lakebase_url()
+
+# Do not print the password/token.
+parsed = urlparse(lakebase_url)
+
+if not parsed.hostname:
+    raise ValueError(
+        f"Unable to determine Lakebase hostname from secret URL."
+    )
+
+if not parsed.username:
+    raise ValueError(
+        "The Lakebase URL does not contain a database username."
+    )
+
+DB_HOST = parsed.hostname
+DB_PORT = parsed.port or 5432
+DB_NAME = parsed.path.lstrip("/")
+
+DB_USER = parsed.username
+
+if not DB_NAME:
+    raise ValueError(
+        "The Lakebase URL does not contain a database name."
+    )
+
+print("Lakebase connection metadata loaded.")
+print(f"Host:     {DB_HOST}")
+print(f"Port:     {DB_PORT}")
+print(f"Database: {DB_NAME}")
+print(f"User:     {DB_USER}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Resolve Lakebase Endpoint
+# MAGIC
+# MAGIC Lakebase OAuth credentials are generated for a specific endpoint.
+# MAGIC
+# MAGIC If `lakebase_endpoint` is supplied as a widget, it is used directly.
+# MAGIC
+# MAGIC Otherwise this notebook derives the endpoint resource name from the
+# MAGIC Lakebase hostname.
+# MAGIC
+# MAGIC For this project, the expected resource is:
+# MAGIC
+# MAGIC `projects/dataexpert-student/branches/production/endpoints/primary`
+# MAGIC
+# MAGIC
+# MAGIC You can override this through the widget if your endpoint differs.
+
+# COMMAND ----------
+
+# DBTITLE 1,Resolve Endpoint Resource Name
+
+def derive_lakebase_endpoint(hostname: str) -> str:
+    """
+    Derive the Lakebase project/branch information from a Lakebase hostname.
+
+    Example hostname:
+
+        ep-muddy-hat-d8d8gsj6.database.us-east-2.cloud.databricks.com
+
+    The hostname alone does not reliably expose the endpoint ID, so for this
+    project we use the known production/primary endpoint convention unless an
+    explicit endpoint override is supplied.
+    """
+
+    # Current project configuration.
+    #
+    # If this project is later moved to another Lakebase project/branch,
+    # provide the full endpoint resource through the widget instead.
+    return (
+        "projects/dataexpert-student/"
+        "branches/production/"
+        "endpoints/primary"
+    )
+
+
+if LAKEBASE_ENDPOINT_OVERRIDE:
+    LAKEBASE_ENDPOINT = LAKEBASE_ENDPOINT_OVERRIDE
+else:
+    LAKEBASE_ENDPOINT = derive_lakebase_endpoint(DB_HOST)
+
+print(f"Lakebase endpoint: {LAKEBASE_ENDPOINT}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Generate a Fresh Lakebase OAuth Credential
+# MAGIC
+# MAGIC The credential generated by the Databricks SDK is short-lived.
+# MAGIC
+# MAGIC We generate a new credential whenever `get_connection()` creates a new
+# MAGIC database connection.
+# MAGIC
+# MAGIC This avoids relying on an expired password embedded in the stored
+# MAGIC `lakebase-url` secret.
+# MAGIC
+# MAGIC Databricks documents `generate_database_credential()` as the current
+# MAGIC mechanism for obtaining an OAuth credential for Lakebase Postgres.
+
+# COMMAND ----------
+
+# DBTITLE 1,Create Lakebase Connection Helper
+
+def get_database_credential():
+    """
+    Generate a fresh OAuth database credential for the Lakebase endpoint.
     """
 
     credential = w.postgres.generate_database_credential(
@@ -245,23 +399,20 @@ def generate_database_credential():
 
     if not credential or not credential.token:
         raise RuntimeError(
-            "Databricks SDK returned a database credential without a token."
+            "Databricks did not return a Lakebase database credential."
         )
-
-    print(
-        "Generated fresh Lakebase database credential "
-        f"(expires: {credential.expire_time})"
-    )
 
     return credential
 
 
 def get_connection():
     """
-    Open a new pg8000 PostgreSQL connection using a fresh Lakebase OAuth token.
+    Open a pg8000 connection using a freshly generated Lakebase OAuth token.
+
+    The OAuth token is passed to PostgreSQL as the password.
     """
 
-    credential = generate_database_credential()
+    credential = get_database_credential()
 
     conn = pg8000.native.Connection(
         host=DB_HOST,
@@ -274,26 +425,31 @@ def get_connection():
 
     return conn
 
-
-print("Lakebase connection helper initialized.")
-
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Test Lakebase Connection
 # MAGIC
-# MAGIC This cell confirms that:
+# MAGIC This is the critical connection test.
 # MAGIC
-# MAGIC 1. The Databricks SDK can generate a Lakebase database credential.
-# MAGIC 2. pg8000 can authenticate to the Lakebase PostgreSQL endpoint.
-# MAGIC 3. The configured database and user are valid.
+# MAGIC Unlike the previous version, this connection:
+# MAGIC
+# MAGIC - does not use `psycopg2`
+# MAGIC - does not use `lakebase.get_connection()`
+# MAGIC - does not use the password stored in `lakebase-url`
+# MAGIC - generates a fresh OAuth database credential
+# MAGIC - uses that credential with `pg8000`
 
 # COMMAND ----------
 
+# DBTITLE 1,Test Fresh OAuth Connection
+
 try:
+
     conn = get_connection()
 
     try:
+
         result = conn.run(
             """
             SELECT
@@ -302,64 +458,93 @@ try:
             """
         )
 
-        if not result:
-            raise RuntimeError(
-                "Connection succeeded but the validation query returned no rows."
-            )
-
         database, user = result[0]
 
         print("✅ Lakebase connection successful.")
         print(f"Database: {database}")
         print(f"User:     {user}")
         print(f"Host:     {DB_HOST}:{DB_PORT}")
+        print(f"Endpoint: {LAKEBASE_ENDPOINT}")
 
     finally:
+
         conn.close()
 
 except Exception as e:
 
     print("❌ Lakebase connection failed.")
     print()
+    print(f"Host:     {DB_HOST}")
+    print(f"Port:     {DB_PORT}")
+    print(f"Database: {DB_NAME}")
+    print(f"User:     {DB_USER}")
+    print(f"Endpoint: {LAKEBASE_ENDPOINT}")
+    print()
     print(f"Error: {e}")
-    print()
-    print("Connection configuration:")
-    print(f"  Host:     {DB_HOST}")
-    print(f"  Port:     {DB_PORT}")
-    print(f"  Database: {DB_NAME}")
-    print(f"  User:     {DB_USER}")
-    print(f"  Endpoint: {LAKEBASE_ENDPOINT}")
-    print()
-    print(
-        "If this reports 'External authorization failed', verify that:"
-    )
-    print(
-        "  1. The Lakebase endpoint exists and is accessible."
-    )
-    print(
-        "  2. The configured DB_USER is a valid PostgreSQL role."
-    )
-    print(
-        "  3. That role is authorized to access this Lakebase endpoint."
-    )
-    print(
-        "  4. The Databricks identity running this notebook has permission "
-        "to generate a database credential."
-    )
+
+    error_str = str(e).lower()
+
+    if "external authorization failed" in error_str:
+
+        print()
+        print("⚠️ External authorization failed.")
+
+        print()
+        print("The notebook generated a fresh OAuth credential, so this")
+        print("error is no longer being treated as a stale secret password.")
+
+        print()
+        print("Check the following:")
+
+        print(
+            "1. The Lakebase endpoint exists and is available."
+        )
+
+        print(
+            "2. The Databricks identity running this notebook has "
+            "permission to generate a database credential for the endpoint."
+        )
+
+        print(
+            "3. The PostgreSQL role/user in the lakebase-url secret "
+            f"({DB_USER!r}) is a valid role for this Lakebase database."
+        )
+
+        print(
+            "4. The endpoint is not blocked by IP ACL/private-link "
+            "configuration."
+        )
+
+        print(
+            "5. The endpoint resource name is correct:"
+        )
+
+        print(
+            f"   {LAKEBASE_ENDPOINT}"
+        )
+
+        print()
+        print(
+            "If the project uses a different endpoint, set the "
+            "'lakebase_endpoint' widget to its full resource name."
+        )
 
     raise
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Verify Required Source Table
+# MAGIC ## Verify Required Tables
 # MAGIC
-# MAGIC The Flask application's `/weather/sync` endpoint should already have
-# MAGIC created and populated:
+# MAGIC Expected source table:
 # MAGIC
 # MAGIC `weather_news`
 # MAGIC
-# MAGIC Expected columns include:
+# MAGIC Expected destination table:
+# MAGIC
+# MAGIC `weather_embeddings`
+# MAGIC
+# MAGIC Expected `weather_news` columns:
 # MAGIC
 # MAGIC - `id`
 # MAGIC - `location`
@@ -370,49 +555,26 @@ except Exception as e:
 # MAGIC - `effective_at`
 # MAGIC - `payload`
 # MAGIC - `synced_at`
+# MAGIC
+# MAGIC Expected `weather_embeddings` columns:
+# MAGIC
+# MAGIC - `id`
+# MAGIC - `document_id`
+# MAGIC - `chunk_index`
+# MAGIC - `chunk_text`
+# MAGIC - `embedding`
+# MAGIC - `model_name`
+# MAGIC - `created_at`
 
 # COMMAND ----------
+
+# DBTITLE 1,Inspect Table Structures
 
 conn = get_connection()
 
 try:
 
-    table_exists_result = conn.run(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND table_name = :table_name
-        )
-        """,
-        table_name=WEATHER_TABLE_NAME,
-    )
-
-    source_table_exists = table_exists_result[0][0]
-
-finally:
-    conn.close()
-
-if not source_table_exists:
-    raise RuntimeError(
-        f"Required source table {WEATHER_TABLE_NAME!r} does not exist."
-    )
-
-print(f"✅ Source table exists: {WEATHER_TABLE_NAME}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Inspect Weather Table Structure
-
-# COMMAND ----------
-
-conn = get_connection()
-
-try:
-
-    table_columns = conn.run(
+    result = conn.run(
         """
         SELECT
             table_name,
@@ -420,31 +582,31 @@ try:
             data_type,
             udt_name
         FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = :table_name
-        ORDER BY ordinal_position
+        WHERE table_name IN (:weather_table, :embedding_table)
+        ORDER BY table_name, ordinal_position
         """,
-        table_name=WEATHER_TABLE_NAME,
+        weather_table=WEATHER_TABLE_NAME,
+        embedding_table=EMBEDDINGS_TABLE_NAME,
     )
 
 finally:
+
     conn.close()
 
-print(f"Columns in {WEATHER_TABLE_NAME}:")
 
-for row in table_columns:
+for row in result:
 
     table_name, column_name, data_type, udt_name = row
 
     print(
-        f"  {table_name}.{column_name}: "
+        f"{table_name}.{column_name}: "
         f"{data_type} ({udt_name})"
     )
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Verify Weather Documents
+# MAGIC ## Check Weather Documents
 # MAGIC
 # MAGIC The Flask application's `/weather/sync` endpoint should be run before
 # MAGIC this notebook.
@@ -463,20 +625,22 @@ for row in table_columns:
 
 # COMMAND ----------
 
+# DBTITLE 1,Count Weather Documents
+
 conn = get_connection()
 
 try:
 
-    total_result = conn.run(
+    result = conn.run(
         f"""
         SELECT COUNT(*)
         FROM {WEATHER_TABLE_NAME}
         """
     )
 
-    total_documents = total_result[0][0]
+    total_documents = result[0][0]
 
-    text_result = conn.run(
+    result = conn.run(
         f"""
         SELECT COUNT(*)
         FROM {WEATHER_TABLE_NAME}
@@ -485,129 +649,15 @@ try:
         """
     )
 
-    documents_with_text = text_result[0][0]
+    documents_with_text = result[0][0]
 
 finally:
+
     conn.close()
 
-print(f"Total weather documents:       {total_documents}")
-print(f"Documents containing text:     {documents_with_text}")
 
-if total_documents == 0:
-
-    print()
-    print("⚠️ No weather documents were found.")
-    print(
-        "Run the Flask application's /weather/sync endpoint before "
-        "running the embedding pipeline."
-    )
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Create / Verify Weather Embeddings Table
-# MAGIC
-# MAGIC The weather application uses:
-# MAGIC
-# MAGIC `weather_embeddings`
-# MAGIC
-# MAGIC The embedding column is PostgreSQL pgvector:
-# MAGIC
-# MAGIC `VECTOR(384)`
-# MAGIC
-# MAGIC An HNSW index using cosine distance is created for semantic search.
-# MAGIC
-# MAGIC If the table already exists, this notebook does not overwrite it.
-
-# COMMAND ----------
-
-conn = get_connection()
-
-try:
-
-    # Enable pgvector if it is not already enabled.
-    conn.run(
-        """
-        CREATE EXTENSION IF NOT EXISTS vector
-        """
-    )
-
-    # Create the destination table if it does not exist.
-    #
-    # The table intentionally uses VECTOR(384) because
-    # all-MiniLM-L6-v2 produces 384-dimensional embeddings.
-    conn.run(
-        f"""
-        CREATE TABLE IF NOT EXISTS {EMBEDDINGS_TABLE_NAME} (
-            id TEXT PRIMARY KEY,
-            document_id TEXT NOT NULL,
-            chunk_index INTEGER NOT NULL,
-            chunk_text TEXT NOT NULL,
-            embedding VECTOR({EMBEDDING_DIM}) NOT NULL,
-            model_name TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            CONSTRAINT {EMBEDDINGS_TABLE_NAME}_document_chunk_unique
-                UNIQUE (document_id, chunk_index)
-        )
-        """
-    )
-
-    # Create an HNSW index for cosine similarity search.
-    conn.run(
-        f"""
-        CREATE INDEX IF NOT EXISTS
-            {EMBEDDINGS_TABLE_NAME}_embedding_hnsw_idx
-        ON {EMBEDDINGS_TABLE_NAME}
-        USING hnsw (embedding vector_cosine_ops)
-        """
-    )
-
-finally:
-    conn.close()
-
-print(f"✅ Embedding table verified: {EMBEDDINGS_TABLE_NAME}")
-print(f"✅ pgvector dimension:       {EMBEDDING_DIM}")
-print("✅ HNSW cosine index verified.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Inspect Embeddings Table Structure
-
-# COMMAND ----------
-
-conn = get_connection()
-
-try:
-
-    embedding_columns = conn.run(
-        """
-        SELECT
-            table_name,
-            column_name,
-            data_type,
-            udt_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = :table_name
-        ORDER BY ordinal_position
-        """,
-        table_name=EMBEDDINGS_TABLE_NAME,
-    )
-
-finally:
-    conn.close()
-
-print(f"Columns in {EMBEDDINGS_TABLE_NAME}:")
-
-for row in embedding_columns:
-
-    table_name, column_name, data_type, udt_name = row
-
-    print(
-        f"  {table_name}.{column_name}: "
-        f"{data_type} ({udt_name})"
-    )
+print(f"Total weather documents:   {total_documents}")
+print(f"Documents containing text: {documents_with_text}")
 
 # COMMAND ----------
 
@@ -619,13 +669,13 @@ for row in embedding_columns:
 # MAGIC
 # MAGIC This makes the notebook safe to run repeatedly:
 # MAGIC
-# MAGIC - Previously embedded documents are skipped.
-# MAGIC - Newly synchronized NWS documents are picked up.
-# MAGIC - Existing embeddings are not duplicated.
-# MAGIC
-# MAGIC Each document can contain multiple chunks.
+# MAGIC - previously embedded documents are skipped
+# MAGIC - newly synchronized NWS documents are picked up
+# MAGIC - existing embeddings are not duplicated
 
 # COMMAND ----------
+
+# DBTITLE 1,Load Unembedded Documents
 
 conn = get_connection()
 
@@ -640,8 +690,7 @@ try:
             d.headline,
             d.narrative_text,
             d.issued_at,
-            d.effective_at,
-            d.synced_at
+            d.effective_at
         FROM {WEATHER_TABLE_NAME} d
         WHERE d.narrative_text IS NOT NULL
           AND TRIM(d.narrative_text) <> ''
@@ -655,31 +704,40 @@ try:
     )
 
 finally:
+
     conn.close()
 
-print(f"Found {len(documents)} unembedded weather documents.")
+
+# Convert tuples to dictionaries.
+documents = [
+    {
+        "id": row[0],
+        "location": row[1],
+        "source_type": row[2],
+        "headline": row[3],
+        "narrative_text": row[4],
+        "issued_at": row[5],
+        "effective_at": row[6],
+    }
+    for row in documents
+]
+
+
+print(
+    f"Found {len(documents)} unembedded weather documents."
+)
+
 
 if documents:
 
     for document in documents[:5]:
 
-        (
-            document_id,
-            location,
-            source_type,
-            headline,
-            narrative_text,
-            issued_at,
-            effective_at,
-            synced_at,
-        ) = document
-
         print(
-            f"\nID: {document_id}"
-            f"\nLocation: {location}"
-            f"\nType: {source_type}"
-            f"\nHeadline: {headline}"
-            f"\nText: {str(narrative_text)[:300]}..."
+            f"\nID: {document['id']}"
+            f"\nLocation: {document['location']}"
+            f"\nType: {document['source_type']}"
+            f"\nHeadline: {document['headline']}"
+            f"\nText: {document['narrative_text'][:300]}..."
         )
 
 # COMMAND ----------
@@ -690,15 +748,17 @@ if documents:
 # MAGIC NWS narrative text is generally short, but alerts can contain substantial
 # MAGIC descriptions and instructions.
 # MAGIC
-# MAGIC We use:
+# MAGIC The assignment recommendation is:
 # MAGIC
 # MAGIC - `CHUNK_SIZE = 800`
 # MAGIC - `CHUNK_OVERLAP = 100`
 # MAGIC
-# MAGIC The overlap preserves some context when a sentence or concept crosses a
-# MAGIC chunk boundary.
+# MAGIC The overlap preserves context when a sentence or concept crosses a chunk
+# MAGIC boundary.
 
 # COMMAND ----------
+
+# DBTITLE 1,Chunk Function
 
 def chunk_text(
     text: str,
@@ -712,7 +772,7 @@ def chunk_text(
     if not text:
         return []
 
-    text = str(text).strip()
+    text = text.strip()
 
     if not text:
         return []
@@ -726,7 +786,9 @@ def chunk_text(
 
     for start in range(0, len(text), step):
 
-        chunk = text[start:start + chunk_size].strip()
+        chunk = text[
+            start:start + chunk_size
+        ].strip()
 
         if chunk:
             chunks.append(chunk)
@@ -736,54 +798,41 @@ def chunk_text(
 
     return chunks
 
+# COMMAND ----------
+
+# DBTITLE 1,Create Chunk Rows
 
 chunk_rows = []
 
 for document in documents:
 
-    (
-        document_id,
-        location,
-        source_type,
-        headline,
-        narrative_text,
-        issued_at,
-        effective_at,
-        synced_at,
-    ) = document
-
-    chunks = chunk_text(narrative_text)
+    chunks = chunk_text(
+        document["narrative_text"]
+    )
 
     for chunk_index, text in enumerate(chunks):
 
         chunk_rows.append(
             {
-                "document_id": document_id,
-                "location": location,
-                "headline": headline,
-                "source_type": source_type,
+                "document_id": document["id"],
+                "location": document["location"],
+                "headline": document["headline"],
+                "source_type": document["source_type"],
                 "chunk_index": chunk_index,
                 "chunk_text": text,
             }
         )
 
-print(f"Created {len(chunk_rows)} text chunks.")
+
+print(
+    f"Created {len(chunk_rows)} text chunks."
+)
+
 
 if chunk_rows:
 
     print("\nSample chunk:")
-
-    print(
-        f"Document ID: {chunk_rows[0]['document_id']}"
-    )
-
-    print(
-        f"Chunk index: {chunk_rows[0]['chunk_index']}"
-    )
-
-    print(
-        f"Text: {chunk_rows[0]['chunk_text'][:500]}"
-    )
+    print(chunk_rows[0])
 
 # COMMAND ----------
 
@@ -796,32 +845,41 @@ if chunk_rows:
 
 # COMMAND ----------
 
-from sentence_transformers import SentenceTransformer
+# DBTITLE 1,Load Sentence Transformer
 
-print(f"Loading {EMBEDDING_MODEL_NAME}...")
+print(
+    f"Loading {EMBEDDING_MODEL_NAME}..."
+)
 
 model = SentenceTransformer(
     EMBEDDING_MODEL_NAME
 )
 
-print("✅ Embedding model loaded successfully.")
+print(
+    "Embedding model loaded successfully."
+)
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Generate Chunk Embeddings
 # MAGIC
-# MAGIC Embeddings are generated in batches to avoid unnecessarily large memory
-# MAGIC usage.
+# MAGIC Embeddings are generated in batches to control memory usage.
 # MAGIC
-# MAGIC Embeddings are normalized so cosine similarity can be used consistently
-# MAGIC during pgvector search.
+# MAGIC Embeddings are normalized so cosine similarity can be calculated directly
+# MAGIC using pgvector's `<=>` cosine-distance operator.
 
 # COMMAND ----------
 
+# DBTITLE 1,Generate Embeddings
+
 embedded_rows = []
 
-for start in range(0, len(chunk_rows), BATCH_SIZE):
+for start in range(
+    0,
+    len(chunk_rows),
+    BATCH_SIZE,
+):
 
     batch = chunk_rows[
         start:start + BATCH_SIZE
@@ -840,32 +898,37 @@ for start in range(0, len(chunk_rows), BATCH_SIZE):
         normalize_embeddings=True,
     )
 
-    for row, vector in zip(batch, vectors):
+    for row, vector in zip(
+        batch,
+        vectors,
+    ):
 
-        vector_dimension = len(vector)
-
-        if vector_dimension != EMBEDDING_DIM:
+        if len(vector) != EMBEDDING_DIM:
 
             raise ValueError(
                 f"Expected {EMBEDDING_DIM}-dimensional vector "
-                f"but received {vector_dimension} dimensions."
+                f"but received {len(vector)} dimensions."
             )
 
         row_with_embedding = dict(row)
 
         row_with_embedding["embedding"] = (
-            vector.astype(float).tolist()
+            vector.tolist()
         )
 
         embedded_rows.append(
             row_with_embedding
         )
 
-    print(
-        f"Embedded "
-        f"{min(start + BATCH_SIZE, len(chunk_rows))}"
-        f"/{len(chunk_rows)} chunks"
+    processed = min(
+        start + BATCH_SIZE,
+        len(chunk_rows),
     )
+
+    print(
+        f"Embedded {processed}/{len(chunk_rows)} chunks"
+    )
+
 
 print(
     f"\nGenerated {len(embedded_rows)} embeddings."
@@ -878,20 +941,22 @@ print(
 
 # COMMAND ----------
 
+# DBTITLE 1,Preview Embedding
+
 if embedded_rows:
 
     sample = embedded_rows[0]
 
     print(
-        f"Document ID: {sample['document_id']}"
+        f"Document ID:      {sample['document_id']}"
     )
 
     print(
-        f"Chunk index: {sample['chunk_index']}"
+        f"Chunk index:       {sample['chunk_index']}"
     )
 
     print(
-        f"Chunk text:  {sample['chunk_text'][:500]}"
+        f"Chunk text:        {sample['chunk_text'][:500]}"
     )
 
     print(
@@ -899,7 +964,7 @@ if embedded_rows:
     )
 
     print(
-        f"Model: {EMBEDDING_MODEL_NAME}"
+        f"Model:             {EMBEDDING_MODEL_NAME}"
     )
 
 else:
@@ -913,12 +978,13 @@ else:
 # MAGIC %md
 # MAGIC ## Write Embeddings to Lakebase
 # MAGIC
-# MAGIC Embeddings are written directly through pg8000.
+# MAGIC The embeddings are written directly through `pg8000`.
 # MAGIC
-# MAGIC The vector is passed as a PostgreSQL vector literal and explicitly cast
-# MAGIC using:
+# MAGIC We intentionally do not use:
 # MAGIC
-# MAGIC `CAST(:embedding AS vector)`
+# MAGIC - psycopg2
+# MAGIC - psycopg2-binary
+# MAGIC - Spark JDBC
 # MAGIC
 # MAGIC
 # MAGIC Each chunk receives a stable ID:
@@ -926,13 +992,25 @@ else:
 # MAGIC `document_id + "_" + chunk_index`
 # MAGIC
 # MAGIC
-# MAGIC The operation uses `ON CONFLICT` so the notebook can safely be re-run.
+# MAGIC The pgvector value is passed as a PostgreSQL vector literal and explicitly
+# MAGIC cast with:
+# MAGIC
+# MAGIC ```sql
+# MAGIC CAST(:embedding AS vector)
+# MAGIC ```
+# MAGIC
+# MAGIC
+# MAGIC This avoids attempting to make Spark understand the pgvector type.
 
 # COMMAND ----------
 
+# DBTITLE 1,Insert Embeddings Using pg8000
+
 if not embedded_rows:
 
-    print("No new embeddings to write.")
+    print(
+        "No new embeddings to write."
+    )
 
 else:
 
@@ -962,7 +1040,7 @@ else:
             chunk_text = EXCLUDED.chunk_text,
             embedding = EXCLUDED.embedding,
             model_name = EXCLUDED.model_name,
-            created_at = CURRENT_TIMESTAMP
+            created_at = EXCLUDED.created_at
     """
 
     total_written = 0
@@ -1001,7 +1079,9 @@ else:
                     insert_sql,
                     id=embedding_id,
                     document_id=row["document_id"],
-                    chunk_index=row["chunk_index"],
+                    chunk_index=int(
+                        row["chunk_index"]
+                    ),
                     chunk_text=row["chunk_text"],
                     embedding=vector_string,
                     model_name=EMBEDDING_MODEL_NAME,
@@ -1015,13 +1095,14 @@ else:
                 f"/{len(embedded_rows)} embeddings"
             )
 
-        # Explicitly commit the transaction.
-        conn.commit()
+        # pg8000.native executes statements directly.
+        # Explicit transaction control keeps the batch atomic.
+        conn.run("COMMIT")
 
     except Exception:
 
         try:
-            conn.rollback()
+            conn.run("ROLLBACK")
         except Exception:
             pass
 
@@ -1031,8 +1112,9 @@ else:
 
         conn.close()
 
+
     print(
-        f"\n✅ Successfully wrote {total_written} embeddings "
+        f"\nSuccessfully wrote {total_written} embeddings "
         f"to {EMBEDDINGS_TABLE_NAME}."
     )
 
@@ -1043,18 +1125,20 @@ else:
 # MAGIC
 # MAGIC Confirm:
 # MAGIC
-# MAGIC - total number of embeddings
-# MAGIC - number of distinct documents
-# MAGIC - pgvector data type
-# MAGIC - embedding dimension
+# MAGIC - total embedding count
+# MAGIC - number of documents represented
+# MAGIC - embedding column type
+# MAGIC - pgvector dimensions
 
 # COMMAND ----------
+
+# DBTITLE 1,Verify Embedding Table
 
 conn = get_connection()
 
 try:
 
-    counts_result = conn.run(
+    result = conn.run(
         f"""
         SELECT
             COUNT(*),
@@ -1063,109 +1147,91 @@ try:
         """
     )
 
-    total_embeddings, documents_embedded = (
-        counts_result[0]
-    )
+    total_embeddings, documents_embedded = result[0]
 
-    column_result = conn.run(
+    result = conn.run(
         """
         SELECT
             column_name,
             data_type,
             udt_name
         FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = :table_name
+        WHERE table_name = :table_name
           AND column_name = 'embedding'
         """,
         table_name=EMBEDDINGS_TABLE_NAME,
     )
 
-    embedding_column = (
-        column_result[0]
-        if column_result
-        else None
-    )
-
-    dimension_result = conn.run(
-        f"""
-        SELECT
-            vector_dims(embedding)
-        FROM {EMBEDDINGS_TABLE_NAME}
-        WHERE embedding IS NOT NULL
-        LIMIT 1
-        """
-    )
-
-    embedding_dimension = (
-        dimension_result[0][0]
-        if dimension_result
-        else None
-    )
+    embedding_column = result[0] if result else None
 
 finally:
 
     conn.close()
 
+
 print(
-    f"Total embeddings:       {total_embeddings}"
+    f"Total embeddings:   {total_embeddings}"
 )
 
 print(
-    f"Documents embedded:     {documents_embedded}"
+    f"Documents embedded: {documents_embedded}"
 )
+
 
 if embedding_column:
 
-    (
-        column_name,
-        data_type,
-        udt_name,
-    ) = embedding_column
-
-    print(
-        f"Embedding data type:    {data_type}"
+    column_name, data_type, udt_name = (
+        embedding_column
     )
 
     print(
-        f"Embedding UDT:          {udt_name}"
+        f"Embedding column:   {column_name}"
     )
-
-if embedding_dimension:
 
     print(
-        f"Embedding dimensions:   {embedding_dimension}"
+        f"Embedding type:     {data_type}"
     )
 
-    if embedding_dimension != EMBEDDING_DIM:
+    print(
+        f"Embedding UDT:      {udt_name}"
+    )
 
-        raise ValueError(
-            f"Expected {EMBEDDING_DIM}-dimensional vectors "
-            f"but database contains {embedding_dimension}-dimensional vectors."
-        )
+else:
+
+    print(
+        "⚠️ Could not find embedding column."
+    )
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Verify HNSW Index
+# MAGIC ## Verify pgvector Dimension
 # MAGIC
-# MAGIC Confirm that the pgvector HNSW cosine-similarity index exists.
+# MAGIC The weather app expects:
+# MAGIC
+# MAGIC `VECTOR(384)`
+# MAGIC
+# MAGIC This query inspects the PostgreSQL column definition.
 
 # COMMAND ----------
+
+# DBTITLE 1,Check Vector Dimension
 
 conn = get_connection()
 
 try:
 
-    index_result = conn.run(
+    result = conn.run(
         """
         SELECT
-            indexname,
-            indexdef
-        FROM pg_indexes
-        WHERE schemaname = 'public'
-          AND tablename = :table_name
-        ORDER BY indexname
+            a.atttypmod
+        FROM pg_attribute a
+        JOIN pg_class c
+          ON c.oid = a.attrelid
+        WHERE c.relname = :table_name
+          AND a.attname = 'embedding'
+          AND a.attnum > 0
+          AND NOT a.attisdropped
         """,
         table_name=EMBEDDINGS_TABLE_NAME,
     )
@@ -1174,32 +1240,90 @@ finally:
 
     conn.close()
 
-print(
-    f"Indexes on {EMBEDDINGS_TABLE_NAME}:"
-)
 
-for index_name, index_definition in index_result:
+if result:
 
-    print()
-    print(index_name)
-    print(index_definition)
-
-hnsw_indexes = [
-    row
-    for row in index_result
-    if "hnsw" in row[1].lower()
-]
-
-if hnsw_indexes:
+    vector_typmod = result[0][0]
 
     print(
-        "\n✅ HNSW vector index detected."
+        f"PostgreSQL vector typmod: {vector_typmod}"
+    )
+
+    print(
+        f"Expected dimensions:       {EMBEDDING_DIM}"
+    )
+
+    # pgvector stores dimension in the type modifier.
+    # The exact typmod value can vary by pgvector version, so the
+    # definitive validation is the vector_dims() query below.
+
+else:
+
+    print(
+        "⚠️ Unable to inspect vector typmod."
+    )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Validate Actual Vector Dimensions
+# MAGIC
+# MAGIC Use pgvector's `vector_dims()` function to verify that stored vectors
+# MAGIC actually contain 384 dimensions.
+
+# COMMAND ----------
+
+# DBTITLE 1,Validate Vector Dimensions
+
+conn = get_connection()
+
+try:
+
+    result = conn.run(
+        f"""
+        SELECT DISTINCT
+            vector_dims(embedding)
+        FROM {EMBEDDINGS_TABLE_NAME}
+        WHERE embedding IS NOT NULL
+        """
+
+    )
+
+finally:
+
+    conn.close()
+
+
+dimensions = [
+    row[0]
+    for row in result
+]
+
+
+print(
+    f"Stored vector dimensions: {dimensions}"
+)
+
+
+if dimensions and dimensions != [EMBEDDING_DIM]:
+
+    raise ValueError(
+        f"Expected stored vectors to have "
+        f"{EMBEDDING_DIM} dimensions, "
+        f"but found {dimensions}."
+    )
+
+
+if dimensions:
+
+    print(
+        f"✅ All stored embeddings are {EMBEDDING_DIM}-dimensional."
     )
 
 else:
 
     print(
-        "\n⚠️ No HNSW index was detected."
+        "No vectors are currently stored."
     )
 
 # COMMAND ----------
@@ -1207,26 +1331,24 @@ else:
 # MAGIC %md
 # MAGIC ## Test Cosine Similarity Search
 # MAGIC
-# MAGIC This validation query confirms that:
+# MAGIC This validates that:
 # MAGIC
-# MAGIC 1. The embedding column is a pgvector.
-# MAGIC 2. The cosine-distance operator `<=>` works.
-# MAGIC 3. Embeddings can be ordered by semantic similarity.
+# MAGIC - the embedding column is a pgvector column
+# MAGIC - vectors are compatible with the expected dimension
+# MAGIC - the cosine-distance operator `<=>` works
+# MAGIC - the stored embeddings can be queried directly from Lakebase
 # MAGIC
 # MAGIC The production version of this logic lives in:
 # MAGIC
 # MAGIC `POST /weather/search`
-# MAGIC
-# MAGIC The Flask endpoint embeds the user's query with the same model and uses
-# MAGIC pgvector's cosine-distance operator.
 
 # COMMAND ----------
 
+# DBTITLE 1,Run Similarity Search Test
+
 if embedded_rows:
 
-    test_vector = (
-        embedded_rows[0]["embedding"]
-    )
+    test_vector = embedded_rows[0]["embedding"]
 
     test_vector_string = (
         "["
@@ -1263,6 +1385,7 @@ if embedded_rows:
 
         conn.close()
 
+
     print(
         "Top 5 similarity results:\n"
     )
@@ -1278,7 +1401,7 @@ if embedded_rows:
         ) = result
 
         print(
-            f"Similarity: {float(similarity):.4f}"
+            f"Similarity: {similarity:.4f}"
         )
 
         print(
@@ -1290,7 +1413,7 @@ if embedded_rows:
         )
 
         print(
-            f"Text:       {str(chunk_text)[:300]}"
+            f"Text:       {chunk_text[:300]}"
         )
 
         print(
@@ -1306,7 +1429,57 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Final Pipeline Validation
+# MAGIC ## Verify HNSW Index
+# MAGIC
+# MAGIC The weather application should have an HNSW cosine-similarity index on
+# MAGIC the `weather_embeddings.embedding` column.
+# MAGIC
+# MAGIC This cell does not create or modify the index. It simply reports the
+# MAGIC indexes currently present on the destination table.
+
+# COMMAND ----------
+
+# DBTITLE 1,Inspect Embedding Indexes
+
+conn = get_connection()
+
+try:
+
+    indexes = conn.run(
+        """
+        SELECT
+            indexname,
+            indexdef
+        FROM pg_indexes
+        WHERE tablename = :table_name
+        ORDER BY indexname
+        """,
+        table_name=EMBEDDINGS_TABLE_NAME,
+    )
+
+finally:
+
+    conn.close()
+
+
+print(
+    f"Indexes on {EMBEDDINGS_TABLE_NAME}:"
+)
+
+for index_name, index_definition in indexes:
+
+    print()
+    print(
+        f"{index_name}:"
+    )
+    print(
+        index_definition
+    )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Pipeline Complete
 # MAGIC
 # MAGIC The weather embedding pipeline is now:
 # MAGIC
@@ -1329,9 +1502,7 @@ else:
 # MAGIC             v
 # MAGIC     weather_embeddings
 # MAGIC             |
-# MAGIC       VECTOR(384)
-# MAGIC             |
-# MAGIC        HNSW / cosine
+# MAGIC       pgvector / HNSW
 # MAGIC             |
 # MAGIC             v
 # MAGIC       /weather/search
@@ -1348,43 +1519,30 @@ else:
 # MAGIC
 # MAGIC The Flask API should return the most semantically relevant weather
 # MAGIC chunks ranked using cosine similarity.
-
-# COMMAND ----------
-
-print("=" * 70)
-print("WEATHER EMBEDDING PIPELINE COMPLETE")
-print("=" * 70)
-
-print()
-print(f"Source table:       {WEATHER_TABLE_NAME}")
-print(f"Embedding table:    {EMBEDDINGS_TABLE_NAME}")
-print(f"Embedding model:    {EMBEDDING_MODEL_NAME}")
-print(f"Embedding dimension:{EMBEDDING_DIM}")
-print(f"Chunk size:         {CHUNK_SIZE}")
-print(f"Chunk overlap:      {CHUNK_OVERLAP}")
-
-print()
-print(f"Weather documents:  {total_documents}")
-print(f"Documents with text:{documents_with_text}")
-print(f"Embeddings:         {total_embeddings}")
-print(f"Documents embedded: {documents_embedded}")
-
-print()
-print("Lakebase driver:    pg8000")
-print("Authentication:     Databricks SDK OAuth credential")
-print("Vector search:      pgvector / HNSW / cosine similarity")
-
-print()
-print("Pipeline:")
-print("  NWS API")
-print("    -> /weather/sync")
-print("    -> weather_news")
-print("    -> ingest_weather_embeddings")
-print("    -> chunk narrative_text")
-print("    -> all-MiniLM-L6-v2")
-print("    -> weather_embeddings")
-print("    -> pgvector / HNSW")
-print("    -> /weather/search")
-
-print()
-print("✅ Notebook completed successfully.")
+# MAGIC
+# MAGIC ## Connection architecture
+# MAGIC
+# MAGIC ```text
+# MAGIC database/lakebase-url
+# MAGIC          |
+# MAGIC          +--> host
+# MAGIC          +--> port
+# MAGIC          +--> database
+# MAGIC          +--> database user
+# MAGIC
+# MAGIC WorkspaceClient()
+# MAGIC          |
+# MAGIC          v
+# MAGIC generate_database_credential()
+# MAGIC          |
+# MAGIC          v
+# MAGIC short-lived OAuth token
+# MAGIC          |
+# MAGIC          v
+# MAGIC pg8000
+# MAGIC          |
+# MAGIC          v
+# MAGIC Lakebase PostgreSQL
+# MAGIC ```
+# MAGIC
+# MAGIC No psycopg2 or psycopg2-binary is used by this notebook.
