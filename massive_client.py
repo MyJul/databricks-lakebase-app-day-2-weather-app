@@ -1,115 +1,230 @@
 """
-Client for the Massive API.
-
-The API key is stored in a Databricks secret scope (see setup_secrets.py) and
-resolved at runtime via the Databricks SDK - it is never stored in code, env
-files, or app.yaml.
+National Weather Service API client.
+The NWS API is the sole weather data source.
+Responsibilities:
+    - Resolve a human-readable location to latitude/longitude
+    - Resolve latitude/longitude to an NWS forecast grid
+    - Retrieve active alerts for the location
+    - Normalize NWS alerts into weather_news document records
+NWS API:
+    https://api.weather.gov
+NWS requires a User-Agent identifying the application.
 """
 
-import base64
-import os
-from typing import Any
-
+import hashlib
+import logging
+from datetime import datetime, timezone
 import requests
-from databricks.sdk import WorkspaceClient
 
-_w = WorkspaceClient()
+logger = logging.getLogger("weather-client")
 
-_SCOPE = os.environ.get("MASSIVE_SECRET_SCOPE", "massive")
-_KEY = os.environ.get("MASSIVE_SECRET_KEY", "api-key")
-_BASE_URL = os.environ.get("MASSIVE_API_BASE_URL", "https://api.massive.com")
+class WeatherClient:
+   
+    BASE_URL = "https://api.weather.gov"
+    GEOCODING_URL = "https://nominatim.openstreetmap.org/search"
 
-_DEFAULT_TIMEOUT = 30
-
-
-def _get_api_key() -> str:
-    """Fetch and decode the Massive API key from the Databricks secret scope."""
-    secret = _w.secrets.get_secret(scope=_SCOPE, key=_KEY)
-    return base64.b64decode(secret.value).decode("utf-8")
-
-
-class MassiveClient:
-    """Thin wrapper around the Massive API with auth + retry-friendly session."""
-
-    def __init__(self, base_url: str | None = None, timeout: int = _DEFAULT_TIMEOUT):
-        self.base_url = (base_url or _BASE_URL).rstrip("/")
+    def __init__(
+        self,
+        user_agent: str = "DatabricksWeatherApp/1.0",
+        timeout: int = 20,
+    ):
         self.timeout = timeout
-        self._session = requests.Session()
-        self._session.headers.update(
-            {
-                "Authorization": f"Bearer {_get_api_key()}",
-                "Content-Type": "application/json",
-            }
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": user_agent,
+            "Accept": "application/geo+json",
+        })
+
+    def _get(self, path: str, params: dict | None = None) -> dict:
+        url = (
+            path
+            if path.startswith("http")
+            else f"{self.BASE_URL}{path}"
         )
 
-    def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        resp = self._session.get(f"{self.base_url}{path}", params=params, timeout=self.timeout)
-        resp.raise_for_status()
-        return resp.json()
+        response = self.session.get(
+            url,
+            params=params,
+            timeout=self.timeout,
+        )
 
-    def post(self, path: str, json: dict[str, Any] | None = None) -> Any:
-        resp = self._session.post(f"{self.base_url}{path}", json=json, timeout=self.timeout)
-        resp.raise_for_status()
-        return resp.json()
+        response.raise_for_status()
+        return response.json()
 
-    def paginated_get(self, path: str, params: dict[str, Any] | None = None, page_size: int = 200):
-        """
-        Generator that yields items across all pages of a "massive" (large)
-        paginated dataset. Assumes a cursor-based API shape:
-        {"items": [...], "next_cursor": "..." | null}
-        Adjust to match the real Massive API pagination contract.
-        """
-        cursor = None
-        params = dict(params or {})
-        params["page_size"] = page_size
+    def geocode_location(self, location: str) -> tuple[float, float]:
+       
+        response = requests.get(
+            self.GEOCODING_URL,
+            params={
+                "q": location,
+                "format": "jsonv2",
+                "limit": 1,
+                "countrycodes": "us",
+            },
+            headers={
+                "User-Agent": "DatabricksWeatherApp/1.0"
+            },
+            timeout=self.timeout,
+        )
 
-        while True:
-            if cursor:
-                params["cursor"] = cursor
-            data = self.get(path, params=params)
-            items = data.get("items", [])
-            for item in items:
-                yield item
+        response.raise_for_status()
+        results = response.json()
 
-            cursor = data.get("next_cursor")
-            if not cursor:
-                break
+        if not results:
+            raise ValueError(
+                f"Unable to resolve location: {location}"
+            )
 
-    def get_latest_price(self, symbol: str) -> dict:
-        """
-        Fetch the latest traded price for a single symbol in a SINGLE API
-        call (no pagination). Use this instead of paginated_get() whenever
-        the caller needs to stay within tight API rate limits (e.g.
-        classroom/student accounts), at the cost of only being able to
-        request one symbol per request.
-        """
-        data = self.get(f"/v2/aggs/ticker/{symbol}/prev")
-        return data
+        return (
+            float(results[0]["lat"]),
+            float(results[0]["lon"]),
+        )
 
-    def get_news(
+    def get_point_metadata(
         self,
-        ticker: str,
+        latitude: float,
+        longitude: float,
+    ) -> dict:
+        return self._get(
+            f"/points/{latitude},{longitude}"
+        )
+
+    def get_active_alerts(
+        self,
+        latitude: float,
+        longitude: float,
         limit: int = 50,
-        published_utc_gte: str | None = None,
     ) -> list[dict]:
-        """
-        Fetch recent news articles for a single ticker in a SINGLE API call
-        (GET /v2/reference/news). Returns just the "results" list - each
-        item has: id, title, description, author, article_url, publisher,
-        tickers, keywords, insights (sentiment), published_utc.
+        data = self._get(
+            "/alerts/active",
+            params={
+                "point": f"{latitude},{longitude}",
+            },
+        )
 
-        published_utc_gte: optional ISO date/datetime string to only fetch
-        articles published on/after this date (maps to the API's
-        "published_utc.gte" filter).
-        """
-        params: dict[str, Any] = {
-            "ticker": ticker,
-            "limit": limit,
-            "order": "desc",
-            "sort": "published_utc",
+        features = data.get("features", [])
+        return features[:limit]
+
+    def get_forecast(
+        self,
+        point_metadata: dict,
+    ) -> dict:
+        properties = point_metadata.get("properties", {})
+        forecast_url = properties.get("forecast")
+        if not forecast_url:
+            raise ValueError(
+                "NWS /points response did not contain a forecast URL"
+            )
+        return self._get(forecast_url)
+
+    @staticmethod
+    def _build_narrative(properties: dict) -> str:
+        parts = []
+        event = properties.get("event")
+        headline = properties.get("headline")
+        description = properties.get("description")
+        instruction = properties.get("instruction")
+        if event:
+            parts.append(f"Event: {event}")
+        if headline:
+            parts.append(f"Headline: {headline}")
+        if description:
+            parts.append(
+                f"Description:\n{description}"
+            )
+        if instruction:
+            parts.append(
+                f"Instructions:\n{instruction}"
+            )
+        return "\n\n".join(parts).strip()
+
+    @staticmethod
+    def _normalize_alert(
+        alert: dict,
+        location: str,
+    ) -> dict | None:
+        alert_id = alert.get("id")
+        if not alert_id:
+            return None
+        properties = alert.get("properties", {})
+        narrative_text = WeatherClient._build_narrative(
+            properties
+        )
+
+        if not narrative_text:
+            return None
+        return {
+            "id": str(alert_id),
+            "location": location,
+            "source_type": "alert",
+            "event": properties.get("event"),
+            "headline": properties.get("headline"),
+            "narrative_text": narrative_text,
+            "description": properties.get("description"),
+            "instruction": properties.get("instruction"),
+            "severity": properties.get("severity"),
+            "certainty": properties.get("certainty"),
+            "urgency": properties.get("urgency"),
+            "effective_at": properties.get("effective"),
+            "onset_at": properties.get("onset"),
+            "expires_at": properties.get("expires"),
+            "sender_name": properties.get("senderName"),
+            "sender_id": properties.get("sender"),
+            "area_desc": properties.get("areaDesc"),
+            "geocode": properties.get("geocode"),
+            "geometry": alert.get("geometry"),
+            "payload": alert,
         }
-        if published_utc_gte:
-            params["published_utc.gte"] = published_utc_gte
 
-        data = self.get("/v2/reference/news", params=params)
-        return data.get("results", [])
+    def get_weather_documents(
+        self,
+        location: str,
+        limit: int = 50,
+    ) -> list[dict]:
+        latitude, longitude = self.geocode_location(
+            location
+        )
+
+        self.get_point_metadata(
+            latitude,
+            longitude,
+        )
+
+        alerts = self.get_active_alerts(
+            latitude,
+            longitude,
+            limit=limit,
+        )
+
+        documents = []
+        for alert in alerts:
+            document = self._normalize_alert(
+                alert,
+                location,
+            )
+            if document:
+                documents.append(document)
+        logger.info(
+            "Retrieved %d weather alerts for %s",
+            len(documents),
+            location,
+        )
+        return documents
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO
+    )
+    client = WeatherClient()
+
+    documents = client.get_weather_documents(
+        "Baltimore, MD",
+        limit=10,
+    )
+    for document in documents:
+        print(
+            document["id"],
+            document["event"],
+            document["headline"],
+        )
+
