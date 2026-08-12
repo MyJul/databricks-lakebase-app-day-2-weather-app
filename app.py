@@ -24,27 +24,13 @@ from sentence_transformers import SentenceTransformer
 import lakebase
 from weather_client import WeatherClient
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("weather-app")
-
 app = Flask(__name__)
 
 WEATHER_TABLE_NAME = os.environ.get("WEATHER_TABLE_NAME", "weather_documents")
-
 EMBEDDINGS_TABLE_NAME = os.environ.get("EMBEDDINGS_TABLE_NAME", "weather_embeddings")
-
 EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-
-DEFAULT_LOCATIONS = [
-    location.strip()
-    for location in os.environ.get(
-        "WEATHER_LOCATIONS",
-        "Baltimore, MD;Washington, DC",
-    ).split(";")
-    if location.strip()
-]
-
 MAX_SEARCH_RESULTS = 20
 
 @app.route("/healthz")
@@ -160,8 +146,7 @@ def sync_weather():
     body = request.get_json(silent=True) or {}
     locations = (
         body.get("locations")
-        or DEFAULT_LOCATIONS
-    )
+     
     if (
         not isinstance(locations, list)
         or not locations
