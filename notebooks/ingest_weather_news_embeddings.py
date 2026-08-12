@@ -1,5 +1,8 @@
 # Databricks notebook source
-
+# /// script
+# [tool.databricks.environment]
+# environment_version = "5"
+# ///
 # MAGIC %md
 # MAGIC # Ingest Weather Documents → Vector Embeddings
 # MAGIC
@@ -17,9 +20,11 @@
 
 # COMMAND ----------
 
-import os
-from sentence_transformers import SentenceTransformer
-import lakebase
+# MAGIC %pip install -q pg8000 sentence-transformers trafilatura requests
+
+# COMMAND ----------
+
+dbutils.library.restartPython()
 
 # COMMAND ----------
 
