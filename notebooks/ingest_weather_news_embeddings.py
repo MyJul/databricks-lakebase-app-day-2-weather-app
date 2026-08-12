@@ -30,16 +30,132 @@ dbutils.library.restartPython()
 
 # MAGIC %md
 # MAGIC ## Configuration
+# MAGIC
+# MAGIC Configure the Lakebase weather tables, embedding model,
+# MAGIC and text chunking parameters.
 
 # COMMAND ----------
 
-WEATHER_TABLE_NAME = os.environ.get("WEATHER_TABLE_NAME", "weather_documents")
-EMBEDDINGS_TABLE_NAME = os.environ.get("EMBEDDINGS_TABLE_NAME", "weather_embeddings")
-EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-EMBEDDING_DIM = 384
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 100
-BATCH_SIZE = 50
+dbutils.widgets.text(
+    "weather_table_name",
+    "weather_documents",
+    "Source table (weather documents)"
+)
+
+dbutils.widgets.text(
+    "embeddings_table_name",
+    "weather_embeddings",
+    "Destination table (weather vectors)"
+)
+
+dbutils.widgets.text(
+    "embedding_model",
+    "sentence-transformers/all-MiniLM-L6-v2",
+    "Embedding model"
+)
+
+dbutils.widgets.text(
+    "chunk_size",
+    "800",
+    "Weather narrative chunk size (chars)"
+)
+
+dbutils.widgets.text(
+    "chunk_overlap",
+    "100",
+    "Weather narrative chunk overlap (chars)"
+)
+
+dbutils.widgets.text(
+    "batch_size",
+    "50",
+    "Embedding batch size"
+)
+
+
+WEATHER_TABLE_NAME = dbutils.widgets.get(
+    "weather_table_name"
+)
+
+EMBEDDINGS_TABLE_NAME = dbutils.widgets.get(
+    "embeddings_table_name"
+)
+
+EMBEDDING_MODEL_NAME = dbutils.widgets.get(
+    "embedding_model"
+)
+
+CHUNK_SIZE = int(
+    dbutils.widgets.get("chunk_size")
+)
+
+CHUNK_OVERLAP = int(
+    dbutils.widgets.get("chunk_overlap")
+)
+
+BATCH_SIZE = int(
+    dbutils.widgets.get("batch_size")
+)
+
+
+# Different sentence-transformers models produce different
+# vector dimensions. The pgvector VECTOR(N) column must
+# match the selected model's output dimension.
+
+match EMBEDDING_MODEL_NAME:
+    case "sentence-transformers/all-MiniLM-L6-v2":
+        EMBEDDING_DIM = 384
+
+    case "sentence-transformers/all-MiniLM-L12-v2":
+        EMBEDDING_DIM = 384
+
+    case "sentence-transformers/all-mpnet-base-v2":
+        EMBEDDING_DIM = 768
+
+    case "sentence-transformers/paraphrase-multilingual-mpnet-base-v2":
+        EMBEDDING_DIM = 768
+
+    case "BAAI/bge-small-en-v1.5":
+        EMBEDDING_DIM = 384
+
+    case "BAAI/bge-base-en-v1.5":
+        EMBEDDING_DIM = 768
+
+    case "BAAI/bge-large-en-v1.5":
+        EMBEDDING_DIM = 1024
+
+    case "text-embedding-3-small":
+        EMBEDDING_DIM = 1536
+
+    case "text-embedding-3-large":
+        EMBEDDING_DIM = 3072
+
+    case _:
+        raise ValueError(
+            f"Unknown embedding model {EMBEDDING_MODEL_NAME!r} - "
+            "add its output dimension to the match/case block "
+            "before running this notebook."
+        )
+
+
+print(
+    f"Using model {EMBEDDING_MODEL_NAME!r} "
+    f"-> {EMBEDDING_DIM}-dim vectors"
+)
+
+print(
+    f"Source table: {WEATHER_TABLE_NAME}"
+)
+
+print(
+    f"Embedding table: {EMBEDDINGS_TABLE_NAME}"
+)
+
+print(
+    f"Chunk size: {CHUNK_SIZE}, "
+    f"overlap: {CHUNK_OVERLAP}, "
+    f"batch size: {BATCH_SIZE}"
+)
 
 # COMMAND ----------
 
