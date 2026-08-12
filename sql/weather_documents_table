@@ -1,28 +1,19 @@
 CREATE TABLE IF NOT EXISTS weather_documents (
     id TEXT PRIMARY KEY,
-
     location TEXT NOT NULL,
-
     source_type TEXT NOT NULL DEFAULT 'alert',
-
     event TEXT,
     headline TEXT,
-
     narrative_text TEXT NOT NULL,
-
     severity TEXT,
     certainty TEXT,
     urgency TEXT,
-
     effective_at TIMESTAMPTZ,
     onset_at TIMESTAMPTZ,
     expires_at TIMESTAMPTZ,
-
     sender_name TEXT,
     area_desc TEXT,
-
     payload JSONB NOT NULL,
-
     synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -30,15 +21,11 @@ CREATE TABLE IF NOT EXISTS weather_documents (
 
 CREATE INDEX IF NOT EXISTS idx_weather_documents_location
     ON weather_documents(location);
-
 CREATE INDEX IF NOT EXISTS idx_weather_documents_event
     ON weather_documents(event);
-
 CREATE INDEX IF NOT EXISTS idx_weather_documents_effective_at
     ON weather_documents(effective_at);
-
 CREATE INDEX IF NOT EXISTS idx_weather_documents_expires_at
     ON weather_documents(expires_at);
-
 CREATE INDEX IF NOT EXISTS idx_weather_documents_source_type
     ON weather_documents(source_type);
