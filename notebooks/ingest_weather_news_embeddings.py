@@ -1,20 +1,32 @@
-"""
-Ingest weather document embeddings into Lakebase.
+# Databricks notebook source
 
-Pipeline:
-    weather_documents
-        -> find new or updated documents
-        -> chunk narrative_text
-        -> sentence-transformers/all-MiniLM-L6-v2
-        -> VECTOR(384)
-        -> weather_embeddings
+# MAGIC %md
+# MAGIC # Ingest Weather Documents → Vector Embeddings
+# MAGIC
+# MAGIC Pipeline:
+# MAGIC
+# MAGIC `weather_documents`
+# MAGIC → find new or updated documents
+# MAGIC → chunk `narrative_text`
+# MAGIC → `sentence-transformers/all-MiniLM-L6-v2`
+# MAGIC → `VECTOR(384)`
+# MAGIC → `weather_embeddings`
+# MAGIC
+# MAGIC This script intentionally uses pg8000 through `lakebase.py`.
+# MAGIC It does not use psycopg2 or Spark JDBC.
 
-This script intentionally uses pg8000 through lakebase.py.
-It does not use psycopg2 or Spark JDBC.
-"""
+# COMMAND ----------
+
 import os
 from sentence_transformers import SentenceTransformer
 import lakebase
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Configuration
+
+# COMMAND ----------
 
 WEATHER_TABLE_NAME = os.environ.get("WEATHER_TABLE_NAME", "weather_documents")
 EMBEDDINGS_TABLE_NAME = os.environ.get("EMBEDDINGS_TABLE_NAME", "weather_embeddings")
@@ -23,6 +35,15 @@ EMBEDDING_DIM = 384
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 BATCH_SIZE = 50
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Chunk Weather Narrative Text
+# MAGIC
+# MAGIC Split weather narrative text into overlapping character-based chunks.
+
+# COMMAND ----------
 
 def chunk_text(
     text: str,
@@ -55,6 +76,16 @@ def chunk_text(
         ):
             break
     return chunks
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Find Documents to Embed
+# MAGIC
+# MAGIC Return documents that have never been embedded or were updated
+# MAGIC after their most recent embedding was created.
+
+# COMMAND ----------
 
 def get_documents_to_embed() -> list[dict]:
     """
@@ -93,6 +124,15 @@ def get_documents_to_embed() -> list[dict]:
         """
     )
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Build Chunk Rows
+# MAGIC
+# MAGIC Create chunk records for each weather document.
+
+# COMMAND ----------
+
 def build_chunk_rows(
     documents: list[dict],
 ) -> list[dict]:
@@ -111,6 +151,15 @@ def build_chunk_rows(
                 "chunk_text": text,
             })
     return chunk_rows
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Generate Embeddings
+# MAGIC
+# MAGIC Generate 384-dimensional embeddings for each text chunk.
+
+# COMMAND ----------
 
 def embed_chunks(
     model: SentenceTransformer,
@@ -155,6 +204,15 @@ def embed_chunks(
             })
     return embedded_rows
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Convert Embeddings to PostgreSQL Vector Format
+# MAGIC
+# MAGIC Convert Python vectors into PostgreSQL vector literal syntax.
+
+# COMMAND ----------
+
 def vector_to_string(
     vector: list[float],
 ) -> str:
@@ -167,6 +225,18 @@ def vector_to_string(
         )
         + "]"
     )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Replace Document Embeddings
+# MAGIC
+# MAGIC Replace embeddings for documents processed in this run.
+# MAGIC
+# MAGIC This allows updated NWS alerts to be re-embedded instead of leaving
+# MAGIC stale chunks in the vector table.
+
+# COMMAND ----------
 
 def replace_document_embeddings(
     document_ids: list[str],
@@ -246,6 +316,15 @@ def replace_document_embeddings(
         finally:
             cur.close()
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Verify Stored Embeddings
+# MAGIC
+# MAGIC Confirm the number of stored embeddings and their vector dimensions.
+
+# COMMAND ----------
+
 def verify_embeddings():
     """Print a simple verification of the stored vector data."""
     rows = lakebase.run_query(
@@ -270,6 +349,22 @@ def verify_embeddings():
             "Maximum dimensions:",
             rows[0]["max_dimensions"],
         )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Run the Embedding Pipeline
+# MAGIC
+# MAGIC This section:
+# MAGIC
+# MAGIC 1. Finds new or updated weather documents.
+# MAGIC 2. Creates text chunks.
+# MAGIC 3. Loads the embedding model.
+# MAGIC 4. Generates embeddings.
+# MAGIC 5. Writes them to Lakebase.
+# MAGIC 6. Verifies the stored vectors.
+
+# COMMAND ----------
 
 def main():
     print(
@@ -328,6 +423,13 @@ def main():
         f"Embeddings written to Lakebase: {written}"
     )
     verify_embeddings()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Execute
+
+# COMMAND ----------
 
 if __name__ == "__main__":
     main()
